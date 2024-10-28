@@ -139,6 +139,7 @@ add_clang_library(clangStaticAnalyzerCheckers
   WebKit/UncountedCallArgsChecker.cpp
   WebKit/UncountedLambdaCapturesChecker.cpp
   WebKit/UncountedLocalVarsChecker.cpp
+  RacyUAFChecker.cpp
 
   LINK_LIBS
   clangAST

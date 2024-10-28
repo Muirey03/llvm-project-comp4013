@@ -1046,6 +1046,10 @@ def ReturnPointerRangeChecker : Checker<"ReturnPtrRange">,
   HelpText<"Check for an out-of-bound pointer being returned to callers">,
   Documentation<HasDocumentation>;
 
+def RacyUAFChecker : Checker<"RacyUAF">,
+  HelpText<"Check for race conditions that could lead to use-after-free bugs">,
+  Documentation<NotDocumented>;
+
 } // end "alpha.security"
 
 
