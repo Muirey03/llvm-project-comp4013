@@ -10,10 +10,10 @@ using namespace clang;
 using namespace ento;
 
 namespace {
-class RacyUAFChecker : public Checker<check::PostCall> {
-public:
-  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
-};
+  class RacyUAFChecker : public Checker<check::PostCall> {
+  public:
+    void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
+  };
 } // end anonymous namespace
 
 void RacyUAFChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
