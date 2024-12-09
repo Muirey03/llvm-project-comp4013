@@ -176,7 +176,20 @@ void RacyUAFChecker::ReleaseLock(const CallEvent &Call, CheckerContext &C) const
 void RacyUAFChecker::checkSummary(const RetainSummary &Summ, const CallEvent &Call, CheckerContext &C) const {
   ProgramStateRef state = C.getState();
 
-  // TODO: evaluate effects on arguments
+  // evaluate effects on arguments:
+  for (unsigned idx = 0, e = Call.getNumArgs(); idx != e; ++idx) {
+    SVal V = Call.getArgSVal(idx);
+    ArgEffect Effect = Summ.getArg(idx);
+
+    if (SymbolRef Sym = V.getAsLocSymbol()) {
+      if (const RefVal *T = getRefBinding(state, Sym)) {
+        // TODO: when an object is passed to a function as a void*,
+        //  RetainCountChecker treats this object as "escaped", and stops tracking it.
+        //  Do we want to do the same?
+        state = updateSymbol(state, Sym, *T, Effect, C);
+      }
+    }
+  }
 
   // evaluate effect on `this`:
   if (const auto *MCall = dyn_cast<CXXMemberCall>(&Call)) {
@@ -237,7 +250,6 @@ ProgramStateRef RacyUAFChecker::updateSymbol(ProgramStateRef state, SymbolRef sy
 
     case IncRef:
       V = V + 1;
-      V.setOwned(true); // TODO: does incrementing the refcnt really mean transfer of ownership?
       llvm::dbgs() << "retain: " << sym << "\n"; // DEBUG
       break;
 
