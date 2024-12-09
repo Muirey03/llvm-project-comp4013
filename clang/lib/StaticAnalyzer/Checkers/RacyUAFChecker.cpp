@@ -1,3 +1,7 @@
+// DEBUG:
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
+
 #include "clang/StaticAnalyzer/Checkers/BuiltinCheckerRegistration.h"
 #include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
 #include "clang/StaticAnalyzer/Core/Checker.h"
@@ -6,10 +10,8 @@
 #include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
 #include "clang/Analysis/RetainSummaryManager.h"
-
-// DEBUG:
-#include "llvm/Support/Debug.h"
-#include "llvm/Support/raw_ostream.h"
+#include <clang/ASTMatchers/ASTMatchers.h>
+#include <clang/ASTMatchers/ASTMatchFinder.h>
 
 using namespace clang;
 using namespace ento;
@@ -106,9 +108,11 @@ namespace {
     // helpers:
     void reportBug(CheckerContext &C, const BugType &bugType, const Expr *MtxExpr, StringRef Desc) const;
 
-    const RefVal *getRefBinding(ProgramStateRef State, SymbolRef Sym) const;
+    ProgramStateRef getRefBinding(ProgramStateRef State, SymbolRef Sym, const RefVal *&Val) const;
 
     ProgramStateRef setRefBinding(ProgramStateRef State, SymbolRef Sym, RefVal Val) const;
+
+    bool shouldTrackSymbol(SymbolRef Sym) const;
   };
 } // end anonymous namespace
 
@@ -182,7 +186,9 @@ void RacyUAFChecker::checkSummary(const RetainSummary &Summ, const CallEvent &Ca
     ArgEffect Effect = Summ.getArg(idx);
 
     if (SymbolRef Sym = V.getAsLocSymbol()) {
-      if (const RefVal *T = getRefBinding(state, Sym)) {
+      const RefVal *T = nullptr;
+      state = getRefBinding(state, Sym, T);
+      if (T) {
         // TODO: when an object is passed to a function as a void*,
         //  RetainCountChecker treats this object as "escaped", and stops tracking it.
         //  Do we want to do the same?
@@ -194,7 +200,9 @@ void RacyUAFChecker::checkSummary(const RetainSummary &Summ, const CallEvent &Ca
   // evaluate effect on `this`:
   if (const auto *MCall = dyn_cast<CXXMemberCall>(&Call)) {
     if (SymbolRef Sym = MCall->getCXXThisVal().getAsLocSymbol()) {
-      if (const RefVal *T = getRefBinding(state, Sym)) {
+      const RefVal *T = nullptr;
+      state = getRefBinding(state, Sym, T);
+      if (T) {
         state = updateSymbol(state, Sym, *T, Summ.getThisEffect(), C);
       }
     }
@@ -297,19 +305,38 @@ void RacyUAFChecker::reportBug(CheckerContext &C, const BugType &bugType, const 
   C.emitReport(std::move(Report));
 }
 
-const RefVal *RacyUAFChecker::getRefBinding(ProgramStateRef State, SymbolRef Sym) const {
-  // TODO: how do we handle untracked symbols?
-  //  Do we begin tracking with a new refcnt of 0?
-  //  Do we check that an object is "trackable"?
-  //  How do we handle malloc/free?
-  //  Often our object *WILL* have been allocated by another thread,
-  //  so we will necessarily need to begin tracking "on-the-fly"
-  return State->get<RefBindings>(Sym);
+ProgramStateRef RacyUAFChecker::getRefBinding(ProgramStateRef State, SymbolRef Sym, const RefVal *&Val) const {
+  const RefVal *V = State->get<RefBindings>(Sym);
+  if (!V) {
+    if (shouldTrackSymbol(Sym)) {
+      State = State->set<RefBindings>(Sym, RefVal::makeNotOwned());
+      V = State->get<RefBindings>(Sym);
+    }
+  }
+  Val = V;
+  return State;
 }
 
 ProgramStateRef RacyUAFChecker::setRefBinding(ProgramStateRef State, SymbolRef Sym, RefVal Val) const {
   assert(Sym != nullptr);
   return State->set<RefBindings>(Sym, Val);
+}
+
+static bool isSubclass(const Decl *D, StringRef ClassName) {
+  using namespace ast_matchers;
+  DeclarationMatcher SubclassM = cxxRecordDecl(isSameOrDerivedFrom(std::string(ClassName)));
+  return !(match(SubclassM, *D, D->getASTContext()).empty());
+}
+
+bool RacyUAFChecker::shouldTrackSymbol(SymbolRef Sym) const {
+  // TODO: how do we handle malloc/free?
+
+  QualType T = Sym->getType();
+  if (T->isPointerType()) {
+    const Decl *D = Sym->getType()->getPointeeCXXRecordDecl();
+    return D && isSubclass(D, "OSMetaClassBase");
+  }
+  return false;
 }
 
 void ento::registerRacyUAFChecker(CheckerManager &mgr) {
