@@ -266,32 +266,19 @@ ProgramStateRef RacyUAFChecker::updateSymbol(ProgramStateRef state, SymbolRef sy
 
     case DecRef:
     case DecRefAndStopTrackingHard:
-      if (V.isOwned()) {
-        assert(V.getCount() > 0);
+      assert(V.getCount() > 0 || !V.isOwned());
 
-        llvm::dbgs() << "release (owned): " << sym << "\n"; // DEBUG
-        if (AE.getKind() == DecRefAndStopTrackingHard) {
-          // TODO: mark V as no longer tracking
-        }
-
-        // if this drops the refcnt to 0, `owned` will be set to false
-        V = V - 1;
-      } else {
-        llvm::dbgs() << "release (not-owned): " << sym << "\n"; // DEBUG
-        if (V.getCount() > 0) {
-          if (AE.getKind() == DecRefAndStopTrackingHard) {
-            // TODO: mark V as no longer tracking
-          }
-          V = V - 1;
-        } else {
-          // TODO: if we're releasing a global object, this won't be a bug
-          llvm::dbgs() << "BUG! over-release: " << sym << "\n"; // DEBUG
-        }
+      if (AE.getKind() == DecRefAndStopTrackingHard) {
+        // TODO: mark V as no longer tracking
       }
+
+      // if this drops the refcnt to 0, `owned` will be set to false
+      llvm::dbgs() << "release: " << sym << "\n"; // DEBUG
+      V = V - 1;
+      // we don't report a bug if the refcnt goes below 0,
+      //  as we could be releasing some global/unowned object
       break;
   }
-
-  // TODO: report bugs
 
   return setRefBinding(state, sym, V);
 }
