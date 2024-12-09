@@ -65,6 +65,7 @@ namespace {
     // bug types:
     const BugType DoubleLockBugType{this, "Double locking"};
     const BugType DoubleUnlockBugType{this, "Double unlocking"};
+    const BugType IllegalAccessBugType{this, "Illegal variable access"};
 
     // maps locking primitives to their respective handlers:
     typedef void (RacyUAFChecker::*FnCheck)(const CallEvent &Call, CheckerContext &C) const;
@@ -103,16 +104,21 @@ namespace {
     // handle retain count manipulation:
     void checkSummary(const RetainSummary &Summ, const CallEvent &Call, CheckerContext &C) const;
 
-    ProgramStateRef updateSymbol(ProgramStateRef state, SymbolRef sym, RefVal V, ArgEffect E, CheckerContext &C) const;
+    // check for race conditions:
+    ProgramStateRef checkSymbolAccess(ProgramStateRef state, const Expr *Expr, SymbolRef sym, RefVal V, CheckerContext &C) const;
+
+    ProgramStateRef updateSymbol(ProgramStateRef state, const Expr *Expr, SymbolRef sym, RefVal V, ArgEffect E, CheckerContext &C) const;
 
     // helpers:
-    void reportBug(CheckerContext &C, const BugType &bugType, const Expr *MtxExpr, StringRef Desc) const;
+    void reportBug(CheckerContext &C, const BugType &bugType, const Expr *Expr, StringRef Desc) const;
 
     ProgramStateRef getRefBinding(ProgramStateRef State, SymbolRef Sym, const RefVal *&Val) const;
 
     ProgramStateRef setRefBinding(ProgramStateRef State, SymbolRef Sym, RefVal Val) const;
 
     bool shouldTrackSymbol(SymbolRef Sym) const;
+
+    bool isSymbolLocked(ProgramStateRef State, SymbolRef Sym) const;
   };
 } // end anonymous namespace
 
@@ -192,7 +198,7 @@ void RacyUAFChecker::checkSummary(const RetainSummary &Summ, const CallEvent &Ca
         // TODO: when an object is passed to a function as a void*,
         //  RetainCountChecker treats this object as "escaped", and stops tracking it.
         //  Do we want to do the same?
-        state = updateSymbol(state, Sym, *T, Effect, C);
+        state = updateSymbol(state, Call.getArgExpr(idx), Sym, *T, Effect, C);
       }
     }
   }
@@ -203,7 +209,7 @@ void RacyUAFChecker::checkSummary(const RetainSummary &Summ, const CallEvent &Ca
       const RefVal *T = nullptr;
       state = getRefBinding(state, Sym, T);
       if (T) {
-        state = updateSymbol(state, Sym, *T, Summ.getThisEffect(), C);
+        state = updateSymbol(state, Call.getOriginExpr(), Sym, *T, Summ.getThisEffect(), C);
       }
     }
   }
@@ -221,9 +227,18 @@ void RacyUAFChecker::checkSummary(const RetainSummary &Summ, const CallEvent &Ca
   C.addTransition(state);
 }
 
-ProgramStateRef RacyUAFChecker::updateSymbol(ProgramStateRef state, SymbolRef sym, RefVal V, ArgEffect AE,
-                                             CheckerContext &C) const {
+ProgramStateRef RacyUAFChecker::checkSymbolAccess(ProgramStateRef state, const Expr *Expr, SymbolRef sym, RefVal V, CheckerContext &C) const {
+  if (!V.isOwned() && !isSymbolLocked(state, sym) && V.getCount() < 1) {
+    reportBug(C, IllegalAccessBugType, Expr, "Potential race condition due to illegal access of unlocked variable.");
+  }
+  return state;
+}
+
+ProgramStateRef RacyUAFChecker::updateSymbol(ProgramStateRef state, const Expr *Expr, SymbolRef sym, RefVal V, ArgEffect AE, CheckerContext &C) const {
   // TODO: don't perform update if V is marked as "stop tracking"
+
+  // check that this variable is safe to access:
+  state = checkSymbolAccess(state, Expr, sym, V, C);
 
   switch (AE.getKind()) {
     case UnretainedOutParameter:
@@ -283,12 +298,12 @@ ProgramStateRef RacyUAFChecker::updateSymbol(ProgramStateRef state, SymbolRef sy
   return setRefBinding(state, sym, V);
 }
 
-void RacyUAFChecker::reportBug(CheckerContext &C, const BugType &bugType, const Expr *MtxExpr, StringRef Desc) const {
+void RacyUAFChecker::reportBug(CheckerContext &C, const BugType &bugType, const Expr *Expr, StringRef Desc) const {
   ExplodedNode *N = C.generateErrorNode();
   if (!N)
     return;
   auto Report = std::make_unique<PathSensitiveBugReport>(bugType, Desc, N);
-  Report->addRange(MtxExpr->getSourceRange());
+  Report->addRange(Expr->getSourceRange());
   C.emitReport(std::move(Report));
 }
 
@@ -324,6 +339,11 @@ bool RacyUAFChecker::shouldTrackSymbol(SymbolRef Sym) const {
     return D && isSubclass(D, "OSMetaClassBase");
   }
   return false;
+}
+
+bool RacyUAFChecker::isSymbolLocked(ProgramStateRef State, SymbolRef Sym) const {
+  // TODO: for now, assume any lock protects all variables
+  return !State->get<LockSet>().isEmpty();
 }
 
 void ento::registerRacyUAFChecker(CheckerManager &mgr) {
