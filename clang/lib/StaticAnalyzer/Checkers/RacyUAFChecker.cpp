@@ -146,8 +146,6 @@ void RacyUAFChecker::AcquireLock(const CallEvent &Call, CheckerContext &C) const
   SVal MtxVal = Call.getArgSVal(0);
   const MemRegion *lockR = MtxVal.getAsRegion();
 
-  llvm::dbgs() << "locking: " << lockR << "\n";
-
   if (!lockR)
     return;
 
@@ -166,9 +164,6 @@ void RacyUAFChecker::ReleaseLock(const CallEvent &Call, CheckerContext &C) const
   const Expr *MtxExpr = Call.getArgExpr(0);
   SVal MtxVal = Call.getArgSVal(0);
   const MemRegion *lockR = MtxVal.getAsRegion();
-
-  // DEBUG:
-  llvm::dbgs() << "unlocking: " << lockR << "\n";
 
   if (!lockR)
     return;
@@ -273,7 +268,6 @@ ProgramStateRef RacyUAFChecker::updateSymbol(ProgramStateRef state, const Expr *
 
     case IncRef:
       V = V + 1;
-      llvm::dbgs() << "retain: " << sym << "\n"; // DEBUG
       break;
 
     case DecRefBridgedTransferred:
@@ -288,7 +282,6 @@ ProgramStateRef RacyUAFChecker::updateSymbol(ProgramStateRef state, const Expr *
       }
 
       // if this drops the refcnt to 0, `owned` will be set to false
-      llvm::dbgs() << "release: " << sym << "\n"; // DEBUG
       V = V - 1;
       // we don't report a bug if the refcnt goes below 0,
       //  as we could be releasing some global/unowned object
