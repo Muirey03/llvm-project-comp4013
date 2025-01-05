@@ -309,7 +309,8 @@ void RacyUAFChecker::checkSummary(const RetainSummary &Summ, const CallEvent &Ca
 
 ProgramStateRef RacyUAFChecker::checkVariableAccess(ProgramStateRef state, const Expr *Expr, const MemRegion *var, SymbolRef sym, CheckerContext &C) const {
   if (sym && Expr) {
-    const RefVal *globalRef = state->get<RefBindings>(sym);
+    const RefVal *globalRef = nullptr;
+    state = getRefBinding(state, sym, globalRef);
     if (globalRef) {
       bool isSafe = globalRef->isOwned() || globalRef->getCount() > 0 || isSymbolLocked(state, sym);
 
