@@ -59,7 +59,8 @@ namespace {
 
   class LocalRef {
   public:
-    LocalRef(bool _safe) : safe(_safe) {}
+    LocalRef(bool _safe) : safe(_safe) {
+    }
 
     // TODO: should this take a set of locks that are protecting the symbol?
     //  This would allow for tracking of `safe` when locks are dropped
@@ -86,7 +87,9 @@ namespace {
   class RacyUAFChecker : public Checker<check::PreCall, check::PostCall, check::Bind> {
   public:
     void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
+
     void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
+
     void checkBind(SVal location, SVal val, const Stmt *S, CheckerContext &C) const;
 
   private:
@@ -133,9 +136,11 @@ namespace {
     void checkSummary(const RetainSummary &Summ, const CallEvent &Call, CheckerContext &C) const;
 
     // check for race conditions:
-    ProgramStateRef checkVariableAccess(ProgramStateRef state, const Expr *Expr, const MemRegion *var, SymbolRef sym, CheckerContext &C) const;
+    ProgramStateRef checkVariableAccess(ProgramStateRef state, const Expr *Expr, const MemRegion *var, SymbolRef sym,
+                                        CheckerContext &C) const;
 
-    ProgramStateRef updateSymbol(ProgramStateRef state, const Expr *Expr, SymbolRef sym, RefVal V, ArgEffect E, CheckerContext &C) const;
+    ProgramStateRef updateSymbol(ProgramStateRef state, const Expr *Expr, SymbolRef sym, RefVal V, ArgEffect E,
+                                 CheckerContext &C) const;
 
     // helpers:
     void reportBug(CheckerContext &C, const BugType &bugType, const Expr *Expr, StringRef Desc) const;
@@ -166,7 +171,7 @@ void RacyUAFChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) cons
   for (unsigned idx = 0, e = Call.getNumArgs(); idx != e; ++idx) {
     SVal V = Call.getArgSVal(idx);
     if (SymbolRef sym = V.getAsLocSymbol()) {
-      const Expr* expr = Call.getArgExpr(idx);
+      const Expr *expr = Call.getArgExpr(idx);
       if (expr) {
         const MemRegion *argRegion = getDeclRefExprRegion(state, expr, C);
         state = checkVariableAccess(state, expr, argRegion, sym, C);
@@ -178,7 +183,7 @@ void RacyUAFChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) cons
   if (const auto *MCall = dyn_cast<CXXMemberCall>(&Call)) {
     SVal V = MCall->getCXXThisVal();
     if (SymbolRef sym = V.getAsLocSymbol()) {
-      const Expr* expr = MCall->getCXXThisExpr();
+      const Expr *expr = MCall->getCXXThisExpr();
       if (expr) {
         const MemRegion *thisRegion = getDeclRefExprRegion(state, expr, C);
         state = checkVariableAccess(state, expr, thisRegion, sym, C);
@@ -205,7 +210,7 @@ void RacyUAFChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) con
 
 void RacyUAFChecker::checkBind(SVal dest, SVal src, const Stmt *S, CheckerContext &C) const {
   ProgramStateRef state = C.getState();
-  const MemRegion* destVar = dest.getAsRegion();
+  const MemRegion *destVar = dest.getAsRegion();
   if (SymbolRef srcSym = src.getAsLocSymbol()) {
     const RefVal *srcGlobalRef = nullptr;
     state = getRefBinding(state, srcSym, srcGlobalRef);
@@ -275,7 +280,7 @@ void RacyUAFChecker::checkSummary(const RetainSummary &Summ, const CallEvent &Ca
         // TODO: when an object is passed to a function as a void*,
         //  RetainCountChecker treats this object as "escaped", and stops tracking it.
         //  Do we want to do the same?
-        const Expr* expr = Call.getArgExpr(idx);
+        const Expr *expr = Call.getArgExpr(idx);
         state = updateSymbol(state, expr, sym, *T, effect, C);
       }
     }
@@ -288,7 +293,7 @@ void RacyUAFChecker::checkSummary(const RetainSummary &Summ, const CallEvent &Ca
       const RefVal *T = nullptr;
       state = getRefBinding(state, sym, T);
       if (T) {
-        const Expr* expr = MCall->getCXXThisExpr();
+        const Expr *expr = MCall->getCXXThisExpr();
         state = updateSymbol(state, expr, sym, *T, Summ.getThisEffect(), C);
       }
     }
@@ -307,7 +312,8 @@ void RacyUAFChecker::checkSummary(const RetainSummary &Summ, const CallEvent &Ca
   C.addTransition(state);
 }
 
-ProgramStateRef RacyUAFChecker::checkVariableAccess(ProgramStateRef state, const Expr *Expr, const MemRegion *var, SymbolRef sym, CheckerContext &C) const {
+ProgramStateRef RacyUAFChecker::checkVariableAccess(ProgramStateRef state, const Expr *Expr, const MemRegion *var,
+                                                    SymbolRef sym, CheckerContext &C) const {
   if (sym && Expr) {
     const RefVal *globalRef = nullptr;
     state = getRefBinding(state, sym, globalRef);
@@ -323,14 +329,16 @@ ProgramStateRef RacyUAFChecker::checkVariableAccess(ProgramStateRef state, const
       }
 
       if (!isSafe) {
-        reportBug(C, IllegalAccessBugType, Expr, "Potential race condition due to illegal access of unlocked variable.");
+        reportBug(C, IllegalAccessBugType, Expr,
+                  "Potential race condition due to illegal access of unlocked variable.");
       }
     }
   }
   return state;
 }
 
-ProgramStateRef RacyUAFChecker::updateSymbol(ProgramStateRef state, const Expr *Expr, SymbolRef sym, RefVal V, ArgEffect AE, CheckerContext &C) const {
+ProgramStateRef RacyUAFChecker::updateSymbol(ProgramStateRef state, const Expr *Expr, SymbolRef sym, RefVal V,
+                                             ArgEffect AE, CheckerContext &C) const {
   // TODO: don't perform update if V is marked as "stop tracking"
 
   switch (AE.getKind()) {
@@ -387,10 +395,10 @@ ProgramStateRef RacyUAFChecker::updateSymbol(ProgramStateRef state, const Expr *
         // TODO: mark V as no longer tracking
       }
 
-      // if this drops the refcnt to 0, `owned` will be set to false
+    // if this drops the refcnt to 0, `owned` will be set to false
       V = V - 1;
-      // we don't report a bug if the refcnt goes below 0,
-      //  as we could be releasing some global/unowned object
+    // we don't report a bug if the refcnt goes below 0,
+    //  as we could be releasing some global/unowned object
       break;
   }
 
@@ -445,11 +453,12 @@ bool RacyUAFChecker::isSymbolLocked(ProgramStateRef State, SymbolRef Sym) const 
   return !State->get<LockSet>().isEmpty();
 }
 
-const MemRegion *RacyUAFChecker::getDeclRefExprRegion(ProgramStateRef state, const Expr *expr, CheckerContext &C) const {
+const MemRegion *
+RacyUAFChecker::getDeclRefExprRegion(ProgramStateRef state, const Expr *expr, CheckerContext &C) const {
   expr = expr->IgnoreCasts();
-  if (const DeclRefExpr* declExpr = dyn_cast_or_null<DeclRefExpr>(expr)) {
-    if (const VarDecl* var = dyn_cast_or_null<VarDecl>(declExpr->getDecl())) {
-      const VarRegion* varRegion = state->getRegion(var, C.getLocationContext());
+  if (const DeclRefExpr *declExpr = dyn_cast_or_null<DeclRefExpr>(expr)) {
+    if (const VarDecl *var = dyn_cast_or_null<VarDecl>(declExpr->getDecl())) {
+      const VarRegion *varRegion = state->getRegion(var, C.getLocationContext());
       return varRegion;
     }
   }
