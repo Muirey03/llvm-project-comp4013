@@ -269,8 +269,10 @@ void RacyUAFChecker::checkSummary(const RetainSummary &Summ, const CallEvent &Ca
       if (T) {
         // check that this argument is safe to access:
         const Expr* expr = Call.getArgExpr(idx);
-        const MemRegion *argRegion = getDeclRefExprRegion(state, expr, C);
-        state = checkVariableAccess(state, expr, argRegion, Sym, C);
+        if (expr) {
+          const MemRegion *argRegion = getDeclRefExprRegion(state, expr, C);
+          state = checkVariableAccess(state, expr, argRegion, Sym, C);
+        }
 
         // TODO: when an object is passed to a function as a void*,
         //  RetainCountChecker treats this object as "escaped", and stops tracking it.
@@ -288,9 +290,11 @@ void RacyUAFChecker::checkSummary(const RetainSummary &Summ, const CallEvent &Ca
       state = getRefBinding(state, Sym, T);
       if (T) {
         // check that receiver is safe to access:
-        const Expr* expr = Call.getOriginExpr();
-        const MemRegion *thisRegion = getDeclRefExprRegion(state, expr, C);
-        state = checkVariableAccess(state, expr, thisRegion, Sym, C);
+        const Expr* expr = MCall->getCXXThisExpr();
+        if (expr) {
+          const MemRegion *thisRegion = getDeclRefExprRegion(state, expr, C);
+          state = checkVariableAccess(state, expr, thisRegion, Sym, C);
+        }
 
         state = updateSymbol(state, Call.getOriginExpr(), Sym, *T, Summ.getThisEffect(), C);
       }
@@ -317,14 +321,19 @@ ProgramStateRef RacyUAFChecker::checkVariableAccess(ProgramStateRef state, const
       bool isSafe = globalRef->isOwned() || globalRef->getCount() > 0 || isSymbolLocked(state, sym);
 
       // if this is a stack variable access, ensure the stack variable is safe too:
+      llvm::dbgs() << "checkVariableAccess(" << sym << ")\n";
       if (var) {
-        llvm::dbgs() << "checkVariableAccess(" << var << ")\n";
+        llvm::dbgs() << "\tvar = " << var << "\n";
+      } else {
+        llvm::dbgs() << "\tvar = <null>\n";
       }
       if (isSafe && var) {
         const LocalRef *localRef = state->get<LocalRefs>(var);
         if (localRef) {
-          llvm::dbgs() << "localRef = " << (localRef->isSafe() ? "safe\n" : "unsafe\n");
+          llvm::dbgs() << "\tlocalRef = " << (localRef->isSafe() ? "safe\n" : "unsafe\n");
           isSafe &= localRef->isSafe();
+        } else {
+          llvm::dbgs() << "\tlocalRef = <null>\n";
         }
       }
 
