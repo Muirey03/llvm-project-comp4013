@@ -261,6 +261,9 @@ void RacyUAFChecker::ReleaseLock(const CallEvent &Call, CheckerContext &C) const
   } else {
     // lock is being released, remove it from the lockset:
     state = state->remove<LockSet>(lockR);
+
+    // TODO: mark any local refs to objects with a refcnt of 0, that this lock was protecting, as unsafe
+
     C.addTransition(state);
   }
 }
@@ -381,7 +384,6 @@ ProgramStateRef RacyUAFChecker::updateSymbol(ProgramStateRef state, const Expr *
 
     case IncRef:
       V = V + 1;
-      llvm::dbgs() << "retain: " << sym << ", owned=" << V.isOwned() << "\n"; // DEBUG
       break;
 
     case DecRefBridgedTransferred:
@@ -399,6 +401,8 @@ ProgramStateRef RacyUAFChecker::updateSymbol(ProgramStateRef state, const Expr *
       V = V - 1;
     // we don't report a bug if the refcnt goes below 0,
     //  as we could be releasing some global/unowned object
+
+    // TODO: if this refcnt hit 0 and the object is unlocked, mark all local refs to it as unsafe
       break;
   }
 
