@@ -71,6 +71,8 @@ namespace {
 
     bool isSafe() const { return safe; }
 
+    void markUnsafe() { safe = false; }
+
     // required to add to LLVM map:
     bool operator==(const LocalRef &X) const {
       return safe == X.isSafe();
@@ -140,7 +142,13 @@ namespace {
                                         CheckerContext &C) const;
 
     ProgramStateRef updateSymbol(ProgramStateRef state, const Expr *Expr, SymbolRef sym, RefVal V, ArgEffect E,
-                                 CheckerContext &C) const;
+                                 CheckerContext &C, bool &didRelease) const;
+
+    ProgramStateRef handleSymbolReleased(ProgramStateRef state, SymbolRef sym, CheckerContext &C) const;
+
+    ProgramStateRef handleSymbolUnlocked(ProgramStateRef state, SymbolRef sym, CheckerContext &C) const;
+
+    ProgramStateRef markReferencesToSymbolUnsafe(ProgramStateRef state, SymbolRef sym, CheckerContext &C) const;
 
     // helpers:
     void reportBug(CheckerContext &C, const BugType &bugType, const Expr *Expr, StringRef Desc) const;
@@ -262,7 +270,7 @@ void RacyUAFChecker::ReleaseLock(const CallEvent &Call, CheckerContext &C) const
     // lock is being released, remove it from the lockset:
     state = state->remove<LockSet>(lockR);
 
-    // TODO: mark any local refs to objects with a refcnt of 0, that this lock was protecting, as unsafe
+    // TODO: call handleSymbolUnlocked on any symbols that this lock was protecting
 
     C.addTransition(state);
   }
@@ -284,7 +292,11 @@ void RacyUAFChecker::checkSummary(const RetainSummary &Summ, const CallEvent &Ca
         //  RetainCountChecker treats this object as "escaped", and stops tracking it.
         //  Do we want to do the same?
         const Expr *expr = Call.getArgExpr(idx);
-        state = updateSymbol(state, expr, sym, *T, effect, C);
+        bool didRelease = false;
+        state = updateSymbol(state, expr, sym, *T, effect, C, didRelease);
+        if (didRelease) {
+          state = handleSymbolReleased(state, sym, C);
+        }
       }
     }
   }
@@ -297,7 +309,11 @@ void RacyUAFChecker::checkSummary(const RetainSummary &Summ, const CallEvent &Ca
       state = getRefBinding(state, sym, T);
       if (T) {
         const Expr *expr = MCall->getCXXThisExpr();
-        state = updateSymbol(state, expr, sym, *T, Summ.getThisEffect(), C);
+        bool didRelease = false;
+        state = updateSymbol(state, expr, sym, *T, Summ.getThisEffect(), C, didRelease);
+        if (didRelease) {
+          state = handleSymbolReleased(state, sym, C);
+        }
       }
     }
   }
@@ -341,8 +357,10 @@ ProgramStateRef RacyUAFChecker::checkVariableAccess(ProgramStateRef state, const
 }
 
 ProgramStateRef RacyUAFChecker::updateSymbol(ProgramStateRef state, const Expr *Expr, SymbolRef sym, RefVal V,
-                                             ArgEffect AE, CheckerContext &C) const {
+                                             ArgEffect AE, CheckerContext &C, bool &didRelease) const {
   // TODO: don't perform update if V is marked as "stop tracking"
+
+  int oldCount = V.getCount();
 
   switch (AE.getKind()) {
     case UnretainedOutParameter:
@@ -401,12 +419,66 @@ ProgramStateRef RacyUAFChecker::updateSymbol(ProgramStateRef state, const Expr *
       V = V - 1;
     // we don't report a bug if the refcnt goes below 0,
     //  as we could be releasing some global/unowned object
-
-    // TODO: if this refcnt hit 0 and the object is unlocked, mark all local refs to it as unsafe
       break;
   }
 
+  // if this symbol just lost all its stack references, and it is unlocked,
+  //  then we need to mark all the local references to it as unsafe
+  int newCount = V.getCount();
+  if (newCount < oldCount && newCount <= 0) {
+    didRelease = true;
+  }
+
   return setRefBinding(state, sym, V);
+}
+
+ProgramStateRef RacyUAFChecker::handleSymbolReleased(ProgramStateRef state, SymbolRef sym, CheckerContext &C) const {
+  // DEBUG:
+  const RefVal *globalRef = nullptr;
+  state = getRefBinding(state, sym, globalRef);
+  assert(sym && globalRef && globalRef->getCount() <= 0);
+
+  // if this symbol is unlocked, we need to mark the references to it as unsafe:
+  if (!isSymbolLocked(state, sym)) {
+    state = markReferencesToSymbolUnsafe(state, sym, C);
+  }
+  return state;
+}
+
+ProgramStateRef RacyUAFChecker::handleSymbolUnlocked(ProgramStateRef state, SymbolRef sym, CheckerContext &C) const {
+  // this symbol may have been protected by multiple variables, so check that is really is unlocked:
+  if (isSymbolLocked(state, sym)) {
+    return state;
+  }
+
+  // if this symbol has 0 refcnt, we need to mark the references to it as unsafe:
+  const RefVal *globalRef = nullptr;
+  state = getRefBinding(state, sym, globalRef);
+  if (globalRef && globalRef->getCount() <= 0) {
+    state = markReferencesToSymbolUnsafe(state, sym, C);
+  }
+  return state;
+}
+
+ProgramStateRef RacyUAFChecker::markReferencesToSymbolUnsafe(ProgramStateRef state, SymbolRef sym,
+                                                             CheckerContext &C) const {
+  auto localRefs = state->get<LocalRefs>();
+  for (auto it = localRefs.begin(); it != localRefs.end(); ++it) {
+    auto [memRegion, localRef] = *it;
+
+    // skip references that are already unsafe:
+    if (!localRef.isSafe()) {
+      continue;
+    }
+
+    // if this variable references sym, mark it as unsafe:
+    SVal localRefSVal = state->getSVal(memRegion);
+    if (localRefSVal.getAsLocSymbol() == sym) {
+      localRef.markUnsafe();
+      state = state->set<LocalRefs>(memRegion, localRef);
+    }
+  }
+  return state;
 }
 
 void RacyUAFChecker::reportBug(CheckerContext &C, const BugType &bugType, const Expr *Expr, StringRef Desc) const {
