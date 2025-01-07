@@ -62,9 +62,10 @@ namespace {
     LocalRef(bool _safe) : safe(_safe) {
     }
 
-    // TODO: should this take a set of locks that are protecting the symbol?
+    // TODO: this take a set of locks that are protecting the symbol
     //  This would allow for tracking of `safe` when locks are dropped
     static LocalRef make(const LocalRef *srcLocalRef, const RefVal &srcGlobalRef, bool isLocked) {
+      // TODO: add sym to each lock's set of protected symbols
       bool srcIsSafe = srcLocalRef ? srcLocalRef->isSafe() : true;
       return LocalRef(srcIsSafe && (isLocked || srcGlobalRef.getCount() > 0));
     }
@@ -251,6 +252,8 @@ void RacyUAFChecker::AcquireLock(const CallEvent &Call, CheckerContext &C) const
   } else {
     // lock is not already taken, add it to the lockset:
     state = state->add<LockSet>(lockR);
+    // see comment in handleSymbolReleased as to why we do not
+    //  need to populate the lock's set of protected symbols here
     C.addTransition(state);
   }
 }
@@ -270,6 +273,7 @@ void RacyUAFChecker::ReleaseLock(const CallEvent &Call, CheckerContext &C) const
     // lock is being released, remove it from the lockset:
     state = state->remove<LockSet>(lockR);
 
+    // TODO: remove all symbols from this lock's set of protected symbols
     // TODO: call handleSymbolUnlocked on any symbols that this lock was protecting
 
     C.addTransition(state);
@@ -441,6 +445,11 @@ ProgramStateRef RacyUAFChecker::handleSymbolReleased(ProgramStateRef state, Symb
   // if this symbol is unlocked, we need to mark the references to it as unsafe:
   if (!isSymbolLocked(state, sym)) {
     state = markReferencesToSymbolUnsafe(state, sym, C);
+  } else {
+    // in order for the lock to be the last item keeping a reference safe, then either:
+    //  - the reference was made during the lock
+    //  - the object was released while locked
+    // TODO: add sym to lock's set of protected symbols
   }
   return state;
 }
