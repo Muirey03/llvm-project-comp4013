@@ -16,6 +16,8 @@
 using namespace clang;
 using namespace ento;
 
+using SmallLockSet = llvm::SmallSet<const MemRegion *, 10>;
+
 namespace {
   class RefVal {
   public:
@@ -157,12 +159,14 @@ namespace {
 
     bool shouldTrackSymbol(SymbolRef Sym) const;
 
-    llvm::ImmutableSet<const MemRegion *> findLocksProtectingSymbol(ProgramStateRef State, SymbolRef Sym) const;
+    SmallLockSet findLocksProtectingSymbol(ProgramStateRef State, SymbolRef Sym) const;
 
     const MemRegion *getDeclRefExprRegion(ProgramStateRef State, const Expr *Expr, CheckerContext &C) const;
 
     ProgramStateRef markSymbolAsLocked(ProgramStateRef State, SymbolRef Sym,
-                                       llvm::ImmutableSet<const MemRegion *> lockedBy) const;
+                                       SmallLockSet lockedBy) const;
+
+    bool isDerivedSymbol(SymbolRef sym, SymbolRef baseSymbol) const;
   };
 } // end anonymous namespace
 
@@ -238,7 +242,7 @@ void RacyUAFChecker::checkBind(SVal dest, SVal src, const Stmt *S, CheckerContex
       // add srcSym to each lock's set of protected symbols
       auto locks = findLocksProtectingSymbol(state, srcSym);
       state = markSymbolAsLocked(state, srcSym, locks);
-      LocalRef destLocalRef = LocalRef::make(srcLocalRef, *srcGlobalRef, !locks.isEmpty());
+      LocalRef destLocalRef = LocalRef::make(srcLocalRef, *srcGlobalRef, !locks.empty());
       state = state->set<LocalRefs>(destVar, destLocalRef);
     }
     C.addTransition(state);
@@ -357,7 +361,7 @@ ProgramStateRef RacyUAFChecker::checkVariableAccess(ProgramStateRef state, const
     state = getRefBinding(state, sym, globalRef);
     if (globalRef) {
       bool isSafe = globalRef->isOwned() || globalRef->getCount() > 0 || !findLocksProtectingSymbol(state, sym).
-                    isEmpty();
+                    empty();
 
       // if this is a stack variable access, ensure the stack variable is safe too:
       if (isSafe && var) {
@@ -460,7 +464,7 @@ ProgramStateRef RacyUAFChecker::handleSymbolReleased(ProgramStateRef state, Symb
 
   // if this symbol is unlocked, we need to mark the references to it as unsafe:
   auto locks = findLocksProtectingSymbol(state, sym);
-  if (locks.isEmpty()) {
+  if (locks.empty()) {
     state = markReferencesToSymbolUnsafe(state, sym);
   } else {
     // in order for the lock to be the last item keeping a reference safe, then either:
@@ -475,7 +479,7 @@ ProgramStateRef RacyUAFChecker::handleSymbolReleased(ProgramStateRef state, Symb
 ProgramStateRef RacyUAFChecker::handleSymbolUnlocked(ProgramStateRef state, SymbolRef sym) const {
   // this symbol may have been protected by multiple variables, so check that is really is unlocked:
   auto locks = findLocksProtectingSymbol(state, sym);
-  if (!locks.isEmpty()) {
+  if (!locks.empty()) {
     return state;
   }
 
@@ -500,9 +504,10 @@ ProgramStateRef RacyUAFChecker::markReferencesToSymbolUnsafe(ProgramStateRef sta
 
     // if this variable references sym, mark it as unsafe:
     SVal localRefSVal = state->getSVal(memRegion);
-    // TODO: instead of checking for exact equality here, check if the localRefSymbol is *encapsulated* within sym.
+    SymbolRef localRefSym = localRefSVal.getAsLocSymbol();
+    // instead of checking for exact equality here, check if the localRefSymbol is *encapsulated* within sym.
     //  this way, we also mark object's fields that were stored on the stack as unsafe
-    if (localRefSVal.getAsLocSymbol() == sym) {
+    if (localRefSym && isDerivedSymbol(localRefSym, sym)) {
       localRef.markUnsafe();
       state = state->set<LocalRefs>(memRegion, localRef);
     }
@@ -553,11 +558,32 @@ bool RacyUAFChecker::shouldTrackSymbol(SymbolRef Sym) const {
   return false;
 }
 
-llvm::ImmutableSet<const MemRegion *> RacyUAFChecker::findLocksProtectingSymbol(ProgramStateRef State,
-  SymbolRef Sym) const {
-  // TODO: for now, assume any lock protects all variables
-  // TODO: should this function call markSymbolAsLocked instead of being the caller's responsibility
-  return State->get<LockSet>();
+SmallLockSet RacyUAFChecker::findLocksProtectingSymbol(ProgramStateRef State,
+                                                       SymbolRef sym) const {
+  SmallLockSet locks;
+
+  const MemRegion *symRegion = sym->getOriginRegion();
+  const MemSpaceRegion *symMemSpace = symRegion ? symRegion->getMemorySpace() : nullptr;
+
+  llvm::ImmutableSet<const MemRegion *> allLocks = State->get<LockSet>();
+  for (const MemRegion *lockR: allLocks) {
+    const SymbolicRegion *symbolicBase = lockR->getSymbolicBase();
+    if (symbolicBase) {
+      // if lock is a member of a symbolic region, sym is locked if it is derived from that region's symbol
+      SymbolRef lockedSym = symbolicBase->getSymbol();
+      if (isDerivedSymbol(sym, lockedSym)) {
+        locks.insert(lockR);
+      }
+    } else if (symMemSpace) {
+      // if lock is a global region, sym is locked if it is derived from a global region in the same translation unit
+      if (lockR->isSubRegionOf(symMemSpace)) {
+        locks.insert(lockR);
+      }
+    }
+  }
+
+  // TODO: should this function call markSymbolAsLocked instead of being the caller's responsibility?
+  return locks;
 }
 
 const MemRegion *
@@ -573,7 +599,7 @@ RacyUAFChecker::getDeclRefExprRegion(ProgramStateRef state, const Expr *expr, Ch
 }
 
 ProgramStateRef RacyUAFChecker::markSymbolAsLocked(ProgramStateRef State, SymbolRef Sym,
-                                                   llvm::ImmutableSet<const MemRegion *> lockedBy) const {
+                                                   SmallLockSet lockedBy) const {
   for (auto it = lockedBy.begin(); it != lockedBy.end(); ++it) {
     const MemRegion *lock = *it;
     const SymbolSet *oldProtectedSymbols = State->get<LockedSymbols>(lock);
@@ -586,6 +612,31 @@ ProgramStateRef RacyUAFChecker::markSymbolAsLocked(ProgramStateRef State, Symbol
     }
   }
   return State;
+}
+
+bool RacyUAFChecker::isDerivedSymbol(SymbolRef sym, SymbolRef baseSymbol) const {
+  while (sym) {
+    if (sym == baseSymbol) {
+      return true;
+    }
+
+    SymbolRef parentSym = nullptr;
+    const MemRegion *originR = sym->getOriginRegion();
+    if (originR) {
+      const SymbolicRegion *symbolicBase = originR->getSymbolicBase();
+      if (symbolicBase) {
+        parentSym = symbolicBase->getSymbol();
+      }
+    }
+    if (parentSym == sym) {
+      llvm::dbgs() << "Parent of " << sym << " is itself?!\n";
+      parentSym = nullptr;
+    }
+
+    sym = parentSym;
+  }
+
+  return false;
 }
 
 void ento::registerRacyUAFChecker(CheckerManager &mgr) {
