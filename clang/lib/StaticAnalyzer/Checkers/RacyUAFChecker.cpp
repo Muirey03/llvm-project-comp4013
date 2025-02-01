@@ -167,6 +167,8 @@ namespace {
                                        SmallLockSet lockedBy) const;
 
     bool isDerivedSymbol(SymbolRef sym, SymbolRef baseSymbol) const;
+
+    const MemSpaceRegion *getSymbolMemorySpace(SymbolRef sym) const;
   };
 } // end anonymous namespace
 
@@ -548,12 +550,22 @@ static bool isSubclass(const Decl *D, StringRef ClassName) {
 }
 
 bool RacyUAFChecker::shouldTrackSymbol(SymbolRef Sym) const {
+  // DEBUG
   // TODO: how do we handle malloc/free?
-
   QualType T = Sym->getType();
   if (T->isPointerType()) {
-    const Decl *D = Sym->getType()->getPointeeCXXRecordDecl();
-    return D && isSubclass(D, "OSMetaClassBase");
+    const Decl *cxxD = T->getPointeeCXXRecordDecl();
+    if (cxxD) {
+      return isSubclass(cxxD, "OSMetaClassBase");
+    }
+
+    QualType pointeeT = T->getPointeeType();
+    if (pointeeT->isStructureType()) {
+      const RecordDecl *strucD = pointeeT->getAsRecordDecl();
+      if (strucD && strucD->getName() == "_DEVMEMINT_CTX_") {
+        return true;
+      }
+    }
   }
   return false;
 }
@@ -562,20 +574,22 @@ SmallLockSet RacyUAFChecker::findLocksProtectingSymbol(ProgramStateRef State,
                                                        SymbolRef sym) const {
   SmallLockSet locks;
 
-  const MemRegion *symRegion = sym->getOriginRegion();
-  const MemSpaceRegion *symMemSpace = symRegion ? symRegion->getMemorySpace() : nullptr;
+  // TODO: optimisation: we only need to get the symbol memory space when we first encounter a global lock
+  //  ie. when lockR->getSymbolicBase() == nullptr
+  const MemSpaceRegion *symMemSpace = getSymbolMemorySpace(sym);
 
   llvm::ImmutableSet<const MemRegion *> allLocks = State->get<LockSet>();
   for (const MemRegion *lockR: allLocks) {
-    const SymbolicRegion *symbolicBase = lockR->getSymbolicBase();
-    if (symbolicBase) {
+    const SymbolicRegion *lockSymBase;
+    if ((lockSymBase = lockR->getSymbolicBase())) {
       // if lock is a member of a symbolic region, sym is locked if it is derived from that region's symbol
-      SymbolRef lockedSym = symbolicBase->getSymbol();
+      SymbolRef lockedSym = lockSymBase->getSymbol();
       if (isDerivedSymbol(sym, lockedSym)) {
         locks.insert(lockR);
       }
     } else if (symMemSpace) {
       // if lock is a global region, sym is locked if it is derived from a global region in the same translation unit
+      // TODO: optimisation: lockR cannot be a subregion of symMemSpace is symMemSpace is "Unknown"
       if (lockR->isSubRegionOf(symMemSpace)) {
         locks.insert(lockR);
       }
@@ -629,7 +643,7 @@ bool RacyUAFChecker::isDerivedSymbol(SymbolRef sym, SymbolRef baseSymbol) const 
       }
     }
     if (parentSym == sym) {
-      llvm::dbgs() << "Parent of " << sym << " is itself?!\n";
+      llvm::errs() << "Parent of " << sym << " is itself?!\n";
       parentSym = nullptr;
     }
 
@@ -637,6 +651,26 @@ bool RacyUAFChecker::isDerivedSymbol(SymbolRef sym, SymbolRef baseSymbol) const 
   }
 
   return false;
+}
+
+const MemSpaceRegion *RacyUAFChecker::getSymbolMemorySpace(SymbolRef sym) const {
+  const MemRegion *R = sym->getOriginRegion();
+  const MemSpaceRegion *space = nullptr;
+  while (R) {
+    space = dyn_cast_or_null<MemSpaceRegion>(R);
+
+    const SymbolicRegion *symR;
+    const SubRegion *subR;
+
+    if (((symR = dyn_cast_or_null<SymbolicRegion>(R))) && ((sym = symR->getSymbol()))) {
+      R = sym->getOriginRegion();
+    } else if ((subR = dyn_cast_or_null<SubRegion>(R))) {
+      R = subR->getSuperRegion();
+    } else {
+      break;
+    }
+  }
+  return space;
 }
 
 void ento::registerRacyUAFChecker(CheckerManager &mgr) {
