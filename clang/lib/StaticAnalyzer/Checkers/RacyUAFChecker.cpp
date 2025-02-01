@@ -115,7 +115,6 @@ namespace {
     };
 
     // manager returns a "summary" about what effect a call should have on the receivers' retain counts
-    // TODO: subclass RetainSummaryManager to handle code annotations
     mutable std::unique_ptr<RetainSummaryManager> Summaries;
 
     RetainSummaryManager &getSummaryManager(ASTContext &Ctx) const {
@@ -143,6 +142,8 @@ namespace {
 
     ProgramStateRef updateSymbol(ProgramStateRef state, const Expr *Expr, SymbolRef sym, RefVal V, ArgEffect E,
                                  CheckerContext &C, bool &didRelease) const;
+
+    ProgramStateRef updateOutParams(ProgramStateRef state, const RetainSummary &Summ, const CallEvent &CE) const;
 
     ProgramStateRef handleSymbolReleased(ProgramStateRef state, SymbolRef sym) const;
 
@@ -222,7 +223,8 @@ void RacyUAFChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) con
     const Expr *CE = Call.getOriginExpr();
     AnyCall anyCall = CE ? *AnyCall::forExpr(CE) : AnyCall(cast<CXXDestructorDecl>(Call.getDecl()));
     QualType ReceiverType; // ReceiverType is exclusively for ObjC messages. We aren't tracking Obj-C, so leave it null
-    const RetainSummary *Summ = Summaries.getSummary(anyCall, Call.hasNonZeroCallbackArg(), false, ReceiverType);
+    const RetainSummary *Summ = Summaries.getSummary(anyCall, false /* TODO: why was I getting true here? */, false,
+                                                     ReceiverType);
     checkSummary(*Summ, Call, C);
   }
 }
@@ -353,6 +355,9 @@ void RacyUAFChecker::checkSummary(const RetainSummary &Summ, const CallEvent &Ca
     }
   }
 
+  // evaluate effect on out parameters:
+  state = updateOutParams(state, Summ, Call);
+
   C.addTransition(state);
 }
 
@@ -406,10 +411,11 @@ ProgramStateRef RacyUAFChecker::updateSymbol(ProgramStateRef state, const Expr *
 
     case MayEscape:
       if (V.isOwned()) {
+        // TODO: revisit this
         // escaping an object converts a stack reference to a global reference:
         V = V - 1;
         V.setOwned(false);
-        llvm::dbgs() << "lose ownership: " << sym << "\n"; // DEBUG
+        // llvm::dbgs() << "lose ownership: " << sym << "\n"; // DEBUG
         break;
       }
       [[fallthrough]];
@@ -456,6 +462,32 @@ ProgramStateRef RacyUAFChecker::updateSymbol(ProgramStateRef state, const Expr *
   }
 
   return setRefBinding(state, sym, V);
+}
+
+ProgramStateRef RacyUAFChecker::updateOutParams(ProgramStateRef state, const RetainSummary &Summ,
+                                                const CallEvent &CE) const {
+  for (unsigned idx = 0, e = CE.getNumArgs(); idx != e; ++idx) {
+    SVal ArgVal = CE.getArgSVal(idx);
+    ArgEffect AE = Summ.getArg(idx);
+
+    auto *ArgRegion = dyn_cast_or_null<TypedValueRegion>(ArgVal.getAsRegion());
+    if (!ArgRegion)
+      continue;
+
+    SVal PointeeVal = state->getSVal(ArgRegion);
+    SymbolRef Sym = PointeeVal.getAsLocSymbol();
+    if (!Sym)
+      continue;
+
+    // TODO: handle splitting on return value correctly
+    if (AE.getKind() == UnretainedOutParameter) {
+      state = setRefBinding(state, Sym, RefVal::makeNotOwned());
+    } else if (AE.getKind() == RetainedOutParameter || AE.getKind() == RetainedOutParameterOnZero || AE.getKind() ==
+               RetainedOutParameterOnNonZero) {
+      state = setRefBinding(state, Sym, RefVal::makeOwned());
+    }
+  }
+  return state;
 }
 
 ProgramStateRef RacyUAFChecker::handleSymbolReleased(ProgramStateRef state, SymbolRef sym) const {
