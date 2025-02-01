@@ -12,6 +12,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+// clang-format off
+
 #include "clang/Analysis/DomainSpecific/CocoaConventions.h"
 #include "clang/Analysis/RetainSummaryManager.h"
 #include "clang/AST/Attr.h"
@@ -63,6 +65,14 @@ struct GeneralizedConsumedAttr {
   }
 };
 
+struct GeneralizedRetainedAttr {
+  static bool classof(const Attr *A) {
+    if (auto AA = dyn_cast<AnnotateAttr>(A))
+      return AA->getAnnotation() == "rc_ownership_retained";
+    return false;
+  }
+};
+
 }
 
 template <class T>
@@ -96,7 +106,7 @@ std::optional<ObjKind> RetainSummaryManager::hasAnyEnabledAttrOf(const Decl *D,
     K = ObjKind::OS;
   } else if (isOneOf<T, GeneralizedReturnsNotRetainedAttr,
                      GeneralizedReturnsRetainedAttr,
-                     GeneralizedConsumedAttr>()) {
+                     GeneralizedConsumedAttr, GeneralizedRetainedAttr>()) {
     K = ObjKind::Generalized;
   } else {
     llvm_unreachable("Unexpected attribute");
@@ -917,6 +927,10 @@ bool RetainSummaryManager::applyParamAnnotationEffect(
                               GeneralizedConsumedAttr>(pd, QT)) {
     Template->addArg(AF, parm_idx, ArgEffect(DecRef, *K));
     return true;
+  } else if (auto K =
+          hasAnyEnabledAttrOf<GeneralizedRetainedAttr>(pd, QT)) {
+    Template->addArg(AF, parm_idx, ArgEffect(IncRef, *K));
+    return true;
   } else if (auto K = hasAnyEnabledAttrOf<
                  CFReturnsRetainedAttr, OSReturnsRetainedAttr,
                  OSReturnsRetainedOnNonZeroAttr, OSReturnsRetainedOnZeroAttr,
@@ -945,6 +959,10 @@ bool RetainSummaryManager::applyParamAnnotationEffect(
         AK = RetainedOutParameterOnNonZero;
       }
       Template->addArg(AF, parm_idx, ArgEffect(AK, ObjKind::OS));
+    }
+
+    if (K == ObjKind::Generalized) {
+      Template->addArg(AF, parm_idx, ArgEffect(RetainedOutParameter, ObjKind::OS));
     }
 
     // For others:
