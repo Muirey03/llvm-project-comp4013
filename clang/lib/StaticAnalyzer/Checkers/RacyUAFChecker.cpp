@@ -86,7 +86,11 @@ namespace {
     bool safe = false;
   };
 
+  class UAFBugVisitor;
+
   class RacyUAFChecker : public Checker<check::PreCall, check::PostCall, check::Bind> {
+    friend class UAFBugVisitor;
+
   public:
     void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
 
@@ -96,8 +100,6 @@ namespace {
 
   private:
     // bug types:
-    const BugType DoubleLockBugType{this, "Double locking"};
-    const BugType DoubleUnlockBugType{this, "Double unlocking"};
     const BugType IllegalAccessBugType{this, "Illegal variable access"};
 
     // maps locking primitives to their respective handlers:
@@ -152,7 +154,8 @@ namespace {
     ProgramStateRef markReferencesToSymbolUnsafe(ProgramStateRef state, SymbolRef sym) const;
 
     // helpers:
-    void reportBug(CheckerContext &C, const BugType &bugType, const Expr *Expr, StringRef Desc) const;
+    void reportBug(CheckerContext &C, const BugType &bugType, const Expr *Expr, const MemRegion *var, SymbolRef sym,
+                   StringRef Desc) const;
 
     ProgramStateRef getRefBinding(ProgramStateRef State, SymbolRef Sym, const RefVal *&Val) const;
 
@@ -170,6 +173,29 @@ namespace {
     bool isDerivedSymbol(SymbolRef sym, SymbolRef baseSymbol) const;
 
     const MemSpaceRegion *getSymbolMemorySpace(SymbolRef sym) const;
+  };
+
+  class UAFBugVisitor : public BugReporterVisitor {
+  public:
+    UAFBugVisitor(const RacyUAFChecker &Chk, const MemRegion *var, SymbolRef sym)
+      : Chk(Chk), Var(var), Sym(sym) {
+    }
+
+    void Profile(llvm::FoldingSetNodeID &ID) const override {
+      static int X = 0;
+      ID.AddPointer(&X);
+      ID.AddPointer(Var);
+      ID.AddPointer(Sym);
+    }
+
+    PathDiagnosticPieceRef VisitNode(const ExplodedNode *N,
+                                     BugReporterContext &BRC,
+                                     PathSensitiveBugReport &BR) override;
+
+  private:
+    const RacyUAFChecker &Chk;
+    const MemRegion *Var;
+    const SymbolRef Sym;
   };
 } // end anonymous namespace
 
@@ -236,7 +262,7 @@ void RacyUAFChecker::checkBind(SVal dest, SVal src, const Stmt *S, CheckerContex
     const RefVal *srcGlobalRef = nullptr;
     state = getRefBinding(state, srcSym, srcGlobalRef);
     if (srcGlobalRef) {
-      // if a local ref exists for the src variable, this should be passed to makeForSymbol
+      // if a local ref exists for the src variable, this should be passed to LocalRef::make
       const MemRegion *srcVar = src.getAsRegion();
       const LocalRef *srcLocalRef = nullptr;
       if (srcVar) {
@@ -254,7 +280,6 @@ void RacyUAFChecker::checkBind(SVal dest, SVal src, const Stmt *S, CheckerContex
 }
 
 void RacyUAFChecker::AcquireLock(const CallEvent &Call, CheckerContext &C) const {
-  const Expr *MtxExpr = Call.getArgExpr(0);
   SVal MtxVal = Call.getArgSVal(0);
   const MemRegion *lockR = MtxVal.getAsRegion();
 
@@ -262,10 +287,7 @@ void RacyUAFChecker::AcquireLock(const CallEvent &Call, CheckerContext &C) const
     return;
 
   ProgramStateRef state = C.getState();
-  if (state->contains<LockSet>(lockR)) {
-    // trying to take a lock that is already taken
-    reportBug(C, DoubleLockBugType, MtxExpr, "This lock has already been acquired");
-  } else {
+  if (!state->contains<LockSet>(lockR)) {
     // lock is not already taken, add it to the lockset:
     state = state->add<LockSet>(lockR);
     // see comment in handleSymbolReleased as to why we do not
@@ -275,7 +297,6 @@ void RacyUAFChecker::AcquireLock(const CallEvent &Call, CheckerContext &C) const
 }
 
 void RacyUAFChecker::ReleaseLock(const CallEvent &Call, CheckerContext &C) const {
-  const Expr *MtxExpr = Call.getArgExpr(0);
   SVal MtxVal = Call.getArgSVal(0);
   const MemRegion *lockR = MtxVal.getAsRegion();
 
@@ -283,9 +304,7 @@ void RacyUAFChecker::ReleaseLock(const CallEvent &Call, CheckerContext &C) const
     return;
 
   ProgramStateRef state = C.getState();
-  if (!state->contains<LockSet>(lockR)) {
-    reportBug(C, DoubleUnlockBugType, MtxExpr, "This lock has already been unlocked");
-  } else {
+  if (state->contains<LockSet>(lockR)) {
     // lock is being released, remove it from the lockset:
     state = state->remove<LockSet>(lockR);
 
@@ -379,8 +398,8 @@ ProgramStateRef RacyUAFChecker::checkVariableAccess(ProgramStateRef state, const
       }
 
       if (!isSafe) {
-        reportBug(C, IllegalAccessBugType, Expr,
-                  "Potential race condition due to illegal access of unlocked variable.");
+        reportBug(C, IllegalAccessBugType, Expr, var, sym,
+                  "Potential race condition due to access of unsafe variable.");
       }
     }
   }
@@ -429,7 +448,7 @@ ProgramStateRef RacyUAFChecker::updateSymbol(ProgramStateRef state, const Expr *
     case StopTracking:
     case StopTrackingHard:
       // TODO: mark V as no longer tracking
-      llvm::dbgs() << "stop tracking: " << sym << "\n"; // DEBUG
+      // llvm::dbgs() << "stop tracking: " << sym << "\n"; // DEBUG
       return state;
 
     case IncRef:
@@ -549,12 +568,14 @@ ProgramStateRef RacyUAFChecker::markReferencesToSymbolUnsafe(ProgramStateRef sta
   return state;
 }
 
-void RacyUAFChecker::reportBug(CheckerContext &C, const BugType &bugType, const Expr *Expr, StringRef Desc) const {
+void RacyUAFChecker::reportBug(CheckerContext &C, const BugType &bugType, const Expr *Expr, const MemRegion *var,
+                               SymbolRef sym, StringRef Desc) const {
   ExplodedNode *N = C.generateErrorNode();
   if (!N)
     return;
   auto Report = std::make_unique<PathSensitiveBugReport>(bugType, Desc, N);
   Report->addRange(Expr->getSourceRange());
+  Report->addVisitor(std::make_unique<UAFBugVisitor>(*this, var, sym));
   C.emitReport(std::move(Report));
 }
 
@@ -703,6 +724,102 @@ const MemSpaceRegion *RacyUAFChecker::getSymbolMemorySpace(SymbolRef sym) const 
     }
   }
   return space;
+}
+
+static const MemRegion *unwrapRValueReferenceIndirection(const MemRegion *MR) {
+  if (const auto *SR = dyn_cast_or_null<SymbolicRegion>(MR)) {
+    SymbolRef Sym = SR->getSymbol();
+    if (Sym->getType()->isRValueReferenceType())
+      if (const MemRegion *OriginMR = Sym->getOriginRegion())
+        return OriginMR;
+  }
+  return MR;
+}
+
+static void explainObject(llvm::raw_ostream &OS, const MemRegion *MR) {
+  if (const auto DR = dyn_cast_or_null<DeclRegion>(unwrapRValueReferenceIndirection(MR))) {
+    const auto *RegionDecl = cast<NamedDecl>(DR->getDecl());
+    OS << "'" << RegionDecl->getDeclName() << "'";
+  } else {
+    OS << MR->getDescriptiveName(true);
+  }
+}
+
+PathDiagnosticPieceRef UAFBugVisitor::VisitNode(const ExplodedNode *N, BugReporterContext &BRC,
+                                                PathSensitiveBugReport &BR) {
+  const Stmt *S = N->getStmtForDiagnostics();
+  if (!S)
+    return nullptr;
+
+  SmallString<128> Str;
+  llvm::raw_svector_ostream OS(Str);
+
+  bool reported = false;
+  ProgramStateRef State = N->getState();
+  ProgramStateRef StatePrev = N->getFirstPred()->getState();
+
+  if (Var) {
+    const LocalRef *newLocalRef = State->get<LocalRefs>(Var);
+    const LocalRef *oldLocalRef = StatePrev->get<LocalRefs>(Var);
+    if (newLocalRef) {
+      bool newSafe = newLocalRef->isSafe();
+      if (!oldLocalRef) {
+        OS << (newSafe ? "Safe" : "Unsafe") << " reference ";
+        explainObject(OS, Var);
+        OS << " taken";
+        reported = true;
+      } else {
+        bool oldSafe = oldLocalRef->isSafe();
+        if (oldSafe && !newSafe) {
+          explainObject(OS, Var);
+          OS << " marked as unsafe";
+          reported = true;
+        }
+      }
+    }
+  }
+
+  if (!reported) {
+    const RefVal *newRef = State->get<RefBindings>(Sym);
+    const RefVal *oldRef = StatePrev->get<RefBindings>(Sym);
+    if (newRef) {
+      int newCnt = newRef->getCount();
+      if (!oldRef) {
+        OS << "Object first referenced";
+        reported = true;
+      } else {
+        int oldCnt = oldRef->getCount();
+        if (oldCnt < newCnt) {
+          OS << "Object retained";
+          reported = true;
+        } else if (oldCnt > newCnt) {
+          OS << "Object released";
+          reported = true;
+        }
+      }
+    }
+  }
+
+  if (!reported) {
+    SmallLockSet oldLocks = Chk.findLocksProtectingSymbol(StatePrev, Sym);
+    SmallLockSet newLocks = Chk.findLocksProtectingSymbol(State, Sym);
+    auto oldLockCnt = oldLocks.size();
+    auto newLockCnt = newLocks.size();
+    if (oldLockCnt < newLockCnt) {
+      OS << "Lock aquired";
+      reported = true;
+    } else if (oldLockCnt > newLockCnt) {
+      OS << "Lock dropped";
+      reported = true;
+    }
+  }
+
+  if (!reported) {
+    return nullptr;
+  }
+
+  PathDiagnosticLocation Pos(S, BRC.getSourceManager(), N->getLocationContext());
+  return std::make_shared<PathDiagnosticEventPiece>(Pos, OS.str(), true);
 }
 
 void ento::registerRacyUAFChecker(CheckerManager &mgr) {
