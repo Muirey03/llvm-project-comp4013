@@ -16,9 +16,17 @@
 using namespace clang;
 using namespace ento;
 
-using SmallLockSet = llvm::SmallSet<const MemRegion *, 10>;
-
 namespace {
+  using SmallLockSet = llvm::SmallSet<const MemRegion *, 10>;
+
+  struct OwnershipTrackedAttr {
+    static bool classof(const Attr *A) {
+      if (auto AA = dyn_cast<AnnotateAttr>(A))
+        return AA->getAnnotation() == "rc_ownership_tracked";
+      return false;
+    }
+  };
+
   class RefVal {
   public:
     RefVal(int _cnt, bool _owned) : cnt(_cnt), owned(_owned) {
@@ -603,21 +611,12 @@ static bool isSubclass(const Decl *D, StringRef ClassName) {
 }
 
 bool RacyUAFChecker::shouldTrackSymbol(SymbolRef Sym) const {
-  // DEBUG
-  // TODO: how do we handle malloc/free?
   QualType T = Sym->getType();
   if (T->isPointerType()) {
-    const Decl *cxxD = T->getPointeeCXXRecordDecl();
-    if (cxxD) {
-      return isSubclass(cxxD, "OSMetaClassBase");
-    }
-
     QualType pointeeT = T->getPointeeType();
-    if (pointeeT->isStructureType()) {
-      const RecordDecl *strucD = pointeeT->getAsRecordDecl();
-      if (strucD && strucD->getName() == "_DEVMEMINT_CTX_") {
-        return true;
-      }
+    if (pointeeT->isRecordType()) {
+      RecordDecl *RD = pointeeT->castAs<RecordType>()->getDecl();
+      return RD->hasAttr<OwnershipTrackedAttr>() || isSubclass(RD, "OSMetaClassBase");
     }
   }
   return false;
