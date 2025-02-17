@@ -213,7 +213,6 @@ namespace {
   };
 } // end anonymous namespace
 
-// TODO: is it better to use MemRegions or SymbolRefs for the lockset?
 REGISTER_SET_WITH_PROGRAMSTATE(LockSet, const MemRegion *)
 
 REGISTER_SET_FACTORY_WITH_PROGRAMSTATE(SymbolSet, SymbolRef)
