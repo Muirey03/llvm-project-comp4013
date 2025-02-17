@@ -36,8 +36,12 @@ namespace {
       }
     }
 
-    static RefVal makeNotOwned() { return RefVal(0, false); }
+    static RefVal makeDefault() { return RefVal(0, false); }
     static RefVal makeOwned() { return RefVal(1, true); }
+
+    // functions will return a reference that is either locked or retained,
+    //  we assume retained
+    static RefVal makeReturned() { return RefVal(1, false); }
 
     int getCount() const { return cnt; }
     void setCount(const int newCnt) { cnt = newCnt; }
@@ -177,6 +181,8 @@ namespace {
 
     ProgramStateRef markSymbolAsLocked(ProgramStateRef State, SymbolRef Sym,
                                        SmallLockSet lockedBy) const;
+
+    SymbolRef getParentSymbol(SymbolRef sym) const;
 
     bool isDerivedSymbol(SymbolRef sym, SymbolRef baseSymbol) const;
 
@@ -375,10 +381,9 @@ void RacyUAFChecker::checkSummary(const RetainSummary &Summ, const CallEvent &Ca
   // evaluate effect on the return value:
   RetEffect RE = Summ.getRetEffect();
   if (SymbolRef Sym = Call.getReturnValue().getAsSymbol()) {
-    if (RE.notOwned()) {
-      state = setRefBinding(state, Sym, RefVal::makeNotOwned());
-    } else if (RE.isOwned()) {
-      state = setRefBinding(state, Sym, RefVal::makeOwned());
+    // if we are already tracking this symbol, don't replace it with what may be a default RetEffect
+    if (shouldTrackSymbol(Sym) && !state->get<RefBindings>(Sym)) {
+      state = setRefBinding(state, Sym, RE.isOwned() ? RefVal::makeOwned() : RefVal::makeReturned());
     }
   }
 
@@ -508,7 +513,7 @@ ProgramStateRef RacyUAFChecker::updateOutParams(ProgramStateRef state, const Ret
 
     // TODO: handle splitting on return value correctly
     if (AE.getKind() == UnretainedOutParameter) {
-      state = setRefBinding(state, Sym, RefVal::makeNotOwned());
+      state = setRefBinding(state, Sym, RefVal::makeReturned());
     } else if (AE.getKind() == RetainedOutParameter || AE.getKind() == RetainedOutParameterOnZero || AE.getKind() ==
                RetainedOutParameterOnNonZero) {
       state = setRefBinding(state, Sym, RefVal::makeOwned());
@@ -588,11 +593,15 @@ void RacyUAFChecker::reportBug(CheckerContext &C, const BugType &bugType, const 
 }
 
 ProgramStateRef RacyUAFChecker::getRefBinding(ProgramStateRef State, SymbolRef Sym, const RefVal *&Val) const {
-  const RefVal *V = State->get<RefBindings>(Sym);
-  if (!V) {
+  const RefVal *V = nullptr;
+  for (; Sym; Sym = getParentSymbol(Sym)) {
     if (shouldTrackSymbol(Sym)) {
-      State = State->set<RefBindings>(Sym, RefVal::makeNotOwned());
       V = State->get<RefBindings>(Sym);
+      if (!V) {
+        State = State->set<RefBindings>(Sym, RefVal::makeDefault());
+        V = State->get<RefBindings>(Sym);
+      }
+      break;
     }
   }
   Val = V;
@@ -680,28 +689,28 @@ ProgramStateRef RacyUAFChecker::markSymbolAsLocked(ProgramStateRef State, Symbol
   return State;
 }
 
+SymbolRef RacyUAFChecker::getParentSymbol(SymbolRef sym) const {
+  SymbolRef parentSym = nullptr;
+  const MemRegion *originR = sym->getOriginRegion();
+  if (originR) {
+    const SymbolicRegion *symbolicBase = originR->getSymbolicBase();
+    if (symbolicBase) {
+      parentSym = symbolicBase->getSymbol();
+    }
+  }
+  if (parentSym == sym) {
+    llvm::errs() << "Parent of " << sym << " is itself?!\n";
+    parentSym = nullptr;
+  }
+  return parentSym;
+}
+
 bool RacyUAFChecker::isDerivedSymbol(SymbolRef sym, SymbolRef baseSymbol) const {
-  while (sym) {
+  for (; sym; sym = getParentSymbol(sym)) {
     if (sym == baseSymbol) {
       return true;
     }
-
-    SymbolRef parentSym = nullptr;
-    const MemRegion *originR = sym->getOriginRegion();
-    if (originR) {
-      const SymbolicRegion *symbolicBase = originR->getSymbolicBase();
-      if (symbolicBase) {
-        parentSym = symbolicBase->getSymbol();
-      }
-    }
-    if (parentSym == sym) {
-      llvm::errs() << "Parent of " << sym << " is itself?!\n";
-      parentSym = nullptr;
-    }
-
-    sym = parentSym;
   }
-
   return false;
 }
 
