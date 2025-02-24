@@ -197,6 +197,8 @@ namespace {
     bool isDerivedSymbol(SymbolRef sym, SymbolRef baseSymbol) const;
 
     const MemSpaceRegion *getSymbolMemorySpace(SymbolRef sym) const;
+
+    const SmallString<128> createBugDescription(CheckerContext &C, const MemRegion *var, SymbolRef sym) const;
   };
 
   class UAFBugVisitor : public BugReporterVisitor {
@@ -437,8 +439,7 @@ ProgramStateRef RacyUAFChecker::checkVariableAccess(ProgramStateRef state, const
       }
 
       if (!isSafe) {
-        reportBug(C, IllegalAccessBugType, Expr, var, sym,
-                  "Potential race condition due to access of unsafe variable.");
+        reportBug(C, IllegalAccessBugType, Expr, var, sym, createBugDescription(C, var, sym));
       }
     }
   }
@@ -777,6 +778,21 @@ static void explainObject(llvm::raw_ostream &OS, const MemRegion *MR) {
   } else {
     OS << MR->getDescriptiveName(true);
   }
+}
+
+const SmallString<128> RacyUAFChecker::createBugDescription(CheckerContext &C, const MemRegion *var,
+                                                            SymbolRef sym) const {
+  SmallString<128> Str;
+  llvm::raw_svector_ostream OS(Str);
+  OS << "Potential race condition due to access of unsafe variable";
+  if (!var) {
+    var = sym->getOriginRegion();
+  }
+  if (var) {
+    OS << ": ";
+    explainObject(OS, var);
+  }
+  return Str;
 }
 
 PathDiagnosticPieceRef UAFBugVisitor::VisitNode(const ExplodedNode *N, BugReporterContext &BRC,
