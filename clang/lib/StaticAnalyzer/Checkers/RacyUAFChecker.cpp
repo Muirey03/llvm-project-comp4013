@@ -27,6 +27,14 @@ namespace {
     }
   };
 
+  struct ThreadEntrypointAttr {
+    static bool classof(const Attr *A) {
+      if (auto AA = dyn_cast<AnnotateAttr>(A))
+        return AA->getAnnotation() == "thread_entrypoint";
+      return false;
+    }
+  };
+
   class RefVal {
   public:
     RefVal(int _cnt, bool _owned) : cnt(_cnt), owned(_owned) {
@@ -100,10 +108,12 @@ namespace {
 
   class UAFBugVisitor;
 
-  class RacyUAFChecker : public Checker<check::PreCall, check::PostCall, check::Bind> {
+  class RacyUAFChecker : public Checker<check::BeginFunction, check::PreCall, check::PostCall, check::Bind> {
     friend class UAFBugVisitor;
 
   public:
+    void checkBeginFunction(CheckerContext &C) const;
+
     void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
 
     void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
@@ -222,6 +232,23 @@ REGISTER_MAP_WITH_PROGRAMSTATE(LockedSymbols, const MemRegion *, SymbolSet)
 REGISTER_MAP_WITH_PROGRAMSTATE(RefBindings, SymbolRef, RefVal)
 
 REGISTER_MAP_WITH_PROGRAMSTATE(LocalRefs, const MemRegion *, LocalRef)
+
+void RacyUAFChecker::checkBeginFunction(CheckerContext &C) const {
+  if (C.inTopFrame()) {
+    bool isValidEntry = false;
+    const LocationContext *LC = C.getLocationContext();
+    if (LC) {
+      const Decl *D = LC->getDecl();
+      if (D) {
+        isValidEntry = D->hasAttr<ThreadEntrypointAttr>();
+      }
+    }
+
+    if (!isValidEntry) {
+      C.addSink();
+    }
+  }
+}
 
 void RacyUAFChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
   ProgramStateRef state = C.getState();
