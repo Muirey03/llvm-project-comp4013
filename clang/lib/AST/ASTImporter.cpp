@@ -10,6 +10,7 @@
 //  context into another context.
 //
 //===----------------------------------------------------------------------===//
+// clang-format off
 
 #include "clang/AST/ASTImporter.h"
 #include "clang/AST/ASTContext.h"
@@ -3820,6 +3821,10 @@ ExpectedDecl ASTNodeImporter::VisitFunctionDecl(FunctionDecl *D) {
 
         // Function overloading is okay in C++.
         if (Importer.getToContext().getLangOpts().CPlusPlus)
+          continue;
+
+        // Support __attribute__((__overloadable__))
+        if (D->hasAttr<OverloadableAttr>() && FoundDecl->hasAttr<OverloadableAttr>())
           continue;
 
         // Complain about inconsistent function types.
