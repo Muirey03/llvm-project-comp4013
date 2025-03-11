@@ -49,7 +49,7 @@ namespace {
 
     // functions will return a reference that is either locked or retained,
     //  we assume retained
-    static RefVal makeReturned() { return RefVal(1, false); }
+    static RefVal makeRetained() { return RefVal(1, false); }
 
     int getCount() const { return cnt; }
     void setCount(const int newCnt) { cnt = newCnt; }
@@ -324,20 +324,32 @@ REGISTER_MAP_WITH_PROGRAMSTATE(RefBindings, SymbolRef, RefVal)
 REGISTER_MAP_WITH_PROGRAMSTATE(LocalRefs, const MemRegion *, LocalRef)
 
 void RacyUAFChecker::checkBeginFunction(CheckerContext &C) const {
-  if (C.inTopFrame()) {
-    bool isValidEntry = false;
-    const LocationContext *LC = C.getLocationContext();
-    if (LC) {
-      const Decl *D = LC->getDecl();
-      if (D) {
-        isValidEntry = D->hasAttr<ThreadEntrypointAttr>();
-      }
-    }
+  const LocationContext *LC = C.getLocationContext();
+  const Decl *D = LC ? LC->getDecl() : nullptr;
 
-    if (!isValidEntry) {
+  if (C.inTopFrame()) {
+    if (!D || !D->hasAttr<ThreadEntrypointAttr>()) {
       C.addSink();
+      return;
     }
   }
+
+  // arguments should be retained if not already tracked:
+  std::optional<AnyCall> Call = AnyCall::forDecl(D);
+  if (!Call)
+    return;
+  ProgramStateRef state = C.getState();
+  for (unsigned idx = 0, e = Call->param_size(); idx != e; ++idx) {
+    const ParmVarDecl *Param = Call->parameters()[idx];
+    SymbolRef Sym = state->getSVal(state->getRegion(Param, LC)).getAsLocSymbol();
+    if (!Sym || state->get<RefBindings>(Sym)) continue;
+
+    if (shouldTrackSymbol(Sym)) {
+      state = setRefBinding(state, Sym, RefVal::makeRetained()); // TODO
+    }
+  }
+
+  C.addTransition(state);
 }
 
 void RacyUAFChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
@@ -688,7 +700,7 @@ ProgramStateRef RacyUAFChecker::updateOutParams(ProgramStateRef state, const Ret
 
     // TODO: handle splitting on return value correctly
     if (AE.getKind() == UnretainedOutParameter) {
-      state = setRefBinding(state, Sym, RefVal::makeReturned());
+      state = setRefBinding(state, Sym, RefVal::makeRetained());
     } else if (AE.getKind() == RetainedOutParameter || AE.getKind() == RetainedOutParameterOnZero || AE.getKind() ==
                RetainedOutParameterOnNonZero) {
       state = setRefBinding(state, Sym, RefVal::makeOwned());
