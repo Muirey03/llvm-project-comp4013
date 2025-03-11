@@ -629,14 +629,6 @@ ProgramStateRef RacyUAFChecker::updateSymbol(ProgramStateRef state, const Expr *
       break;
 
     case MayEscape:
-      if (V.isOwned()) {
-        // TODO: revisit this
-        // escaping an object converts a stack reference to a global reference:
-        V = V - 1;
-        V.setOwned(false);
-        // llvm::dbgs() << "lose ownership: " << sym << "\n"; // DEBUG
-        break;
-      }
       [[fallthrough]];
 
     case DoNothing:
