@@ -124,18 +124,97 @@ namespace {
     // bug types:
     const BugType IllegalAccessBugType{this, "Illegal variable access"};
 
+    // locking semantics:
+    enum LockingSemantics { NotApplicable = 0, PthreadSemantics, XNUSemantics };
+
     // maps locking primitives to their respective handlers:
     typedef void (RacyUAFChecker::*FnCheck)(const CallEvent &Call, CheckerContext &C) const;
 
     CallDescriptionMap<FnCheck> PostCallHandlers = {
+      // Acquire.
       {
         {CDM::CLibrary, {"pthread_mutex_lock"}, 1},
-        &RacyUAFChecker::AcquireLock
+        &RacyUAFChecker::AcquirePthreadLock
       },
+      {
+        {CDM::CLibrary, {"pthread_rwlock_rdlock"}, 1},
+        &RacyUAFChecker::AcquirePthreadLock
+      },
+      {
+        {CDM::CLibrary, {"pthread_rwlock_wrlock"}, 1},
+        &RacyUAFChecker::AcquirePthreadLock
+      },
+      {
+        {CDM::CLibrary, {"lck_mtx_lock"}, 1},
+        &RacyUAFChecker::AcquireXNULock
+      },
+      {
+        {CDM::CLibrary, {"lck_rw_lock_exclusive"}, 1},
+        &RacyUAFChecker::AcquireXNULock
+      },
+      {
+        {CDM::CLibrary, {"lck_rw_lock_shared"}, 1},
+        &RacyUAFChecker::AcquireXNULock
+      },
+
+      // Try.
+      {
+        {CDM::CLibrary, {"pthread_mutex_trylock"}, 1},
+        &RacyUAFChecker::TryPthreadLock
+      },
+      {
+        {CDM::CLibrary, {"pthread_rwlock_tryrdlock"}, 1},
+        &RacyUAFChecker::TryPthreadLock
+      },
+      {
+        {CDM::CLibrary, {"pthread_rwlock_trywrlock"}, 1},
+        &RacyUAFChecker::TryPthreadLock
+      },
+      {
+        {CDM::CLibrary, {"lck_mtx_try_lock"}, 1},
+        &RacyUAFChecker::TryXNULock
+      },
+      {
+        {CDM::CLibrary, {"lck_rw_try_lock_exclusive"}, 1},
+        &RacyUAFChecker::TryXNULock
+      },
+      {
+        {CDM::CLibrary, {"lck_rw_try_lock_shared"}, 1},
+        &RacyUAFChecker::TryXNULock
+      },
+
+      // Release.
       {
         {CDM::CLibrary, {"pthread_mutex_unlock"}, 1},
         &RacyUAFChecker::ReleaseLock
       },
+      {
+        {CDM::CLibrary, {"pthread_rwlock_unlock"}, 1},
+        &RacyUAFChecker::ReleaseLock
+      },
+      {
+        {CDM::CLibrary, {"lck_mtx_unlock"}, 1},
+        &RacyUAFChecker::ReleaseLock
+      },
+      {
+        {CDM::CLibrary, {"lck_rw_unlock_exclusive"}, 1},
+        &RacyUAFChecker::ReleaseLock
+      },
+      {
+        {CDM::CLibrary, {"lck_rw_unlock_shared"}, 1},
+        &RacyUAFChecker::ReleaseLock
+      },
+      {
+        {CDM::CLibrary, {"lck_rw_done"}, 1},
+        &RacyUAFChecker::ReleaseLock
+      },
+    };
+
+    CallDescriptionSet TrustedRCImplementations = {
+      {CDM::CXXMethod, {"libkern", "intrusive_shared_ptr", "intrusive_shared_ptr"}},
+      {CDM::CXXMethod, {"libkern", "intrusive_shared_ptr", "~intrusive_shared_ptr"}},
+      {CDM::CXXMethod, {"libkern", "intrusive_shared_ptr", "operator="}},
+      {CDM::CXXMethod, {"libkern", "intrusive_shared_ptr", "reset"}},
     };
 
     // manager returns a "summary" about what effect a call should have on the receivers' retain counts
@@ -153,7 +232,16 @@ namespace {
     }
 
     // handle locking primitives:
-    void AcquireLock(const CallEvent &Call, CheckerContext &C) const;
+    void AcquireLockAux(const CallEvent &Call, CheckerContext &C, SVal MtxVal, bool IsTryLock,
+                        enum LockingSemantics Semantics) const;
+
+    void AcquirePthreadLock(const CallEvent &Call, CheckerContext &C) const;
+
+    void AcquireXNULock(const CallEvent &Call, CheckerContext &C) const;
+
+    void TryPthreadLock(const CallEvent &Call, CheckerContext &C) const;
+
+    void TryXNULock(const CallEvent &Call, CheckerContext &C) const;
 
     void ReleaseLock(const CallEvent &Call, CheckerContext &C) const;
 
@@ -321,21 +409,81 @@ void RacyUAFChecker::checkBind(SVal dest, SVal src, const Stmt *S, CheckerContex
   }
 }
 
-void RacyUAFChecker::AcquireLock(const CallEvent &Call, CheckerContext &C) const {
-  SVal MtxVal = Call.getArgSVal(0);
+void RacyUAFChecker::AcquireLockAux(const CallEvent &Call,
+                                    CheckerContext &C,
+                                    SVal MtxVal, bool IsTryLock,
+                                    enum LockingSemantics Semantics) const {
   const MemRegion *lockR = MtxVal.getAsRegion();
 
   if (!lockR)
     return;
 
   ProgramStateRef state = C.getState();
-  if (!state->contains<LockSet>(lockR)) {
+  if (state->contains<LockSet>(lockR)) {
+    return;
+  }
+
+  ProgramStateRef lockSucc = state;
+  if (IsTryLock) {
+    // Bifurcate the state, and allow a mode where the lock acquisition fails.
+    SVal RetVal = Call.getReturnValue();
+    if (auto DefinedRetVal = RetVal.getAs<DefinedSVal>()) {
+      ProgramStateRef lockFail;
+      switch (Semantics) {
+        case PthreadSemantics:
+          std::tie(lockFail, lockSucc) = state->assume(*DefinedRetVal);
+          break;
+        case XNUSemantics:
+          std::tie(lockSucc, lockFail) = state->assume(*DefinedRetVal);
+          break;
+        default:
+          llvm_unreachable("Unknown tryLock locking semantics");
+      }
+
+      if (lockFail)
+        C.addTransition(lockFail);
+    }
+    // We might want to handle the case when the mutex lock function was inlined
+    // and returned an Unknown or Undefined value.
+  } else if (Semantics == PthreadSemantics) {
+    // Assume that the return value was 0.
+    SVal RetVal = Call.getReturnValue();
+    if (auto DefinedRetVal = RetVal.getAs<DefinedSVal>()) {
+      // FIXME: If the lock function was inlined and returned true,
+      // we need to behave sanely - at least generate sink.
+      lockSucc = state->assume(*DefinedRetVal, false);
+    }
+    // We might want to handle the case when the mutex lock function was inlined
+    // and returned an Unknown or Undefined value.
+  } else {
+    // XNU locking semantics return void on non-try locks
+    assert((Semantics == XNUSemantics) && "Unknown locking semantics");
+    lockSucc = state;
+  }
+
+  if (lockSucc) {
     // lock is not already taken, add it to the lockset:
-    state = state->add<LockSet>(lockR);
+    lockSucc = lockSucc->add<LockSet>(lockR);
     // see comment in handleSymbolReleased as to why we do not
     //  need to populate the lock's set of protected symbols here
-    C.addTransition(state);
+    C.addTransition(lockSucc);
   }
+}
+
+void RacyUAFChecker::AcquirePthreadLock(const CallEvent &Call, CheckerContext &C) const {
+  AcquireLockAux(Call, C, Call.getArgSVal(0), false, PthreadSemantics);
+}
+
+void RacyUAFChecker::AcquireXNULock(const CallEvent &Call, CheckerContext &C) const {
+  AcquireLockAux(Call, C, Call.getArgSVal(0), false, XNUSemantics);
+}
+
+void RacyUAFChecker::TryPthreadLock(const CallEvent &Call, CheckerContext &C) const {
+  AcquireLockAux(Call, C, Call.getArgSVal(0), true, PthreadSemantics);
+}
+
+void RacyUAFChecker::TryXNULock(const CallEvent &Call, CheckerContext &C) const {
+  AcquireLockAux(Call, C, Call.getArgSVal(0), true, XNUSemantics);
 }
 
 void RacyUAFChecker::ReleaseLock(const CallEvent &Call, CheckerContext &C) const {
