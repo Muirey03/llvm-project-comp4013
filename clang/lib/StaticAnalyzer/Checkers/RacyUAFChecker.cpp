@@ -571,7 +571,7 @@ void RacyUAFChecker::checkSummary(const RetainSummary &Summ, const CallEvent &Ca
   if (SymbolRef Sym = Call.getReturnValue().getAsSymbol()) {
     // if we are already tracking this symbol, don't replace it with what may be a default RetEffect
     if (shouldTrackSymbol(Sym) && !state->get<RefBindings>(Sym)) {
-      state = setRefBinding(state, Sym, RE.isOwned() ? RefVal::makeOwned() : RefVal::makeReturned());
+      state = setRefBinding(state, Sym, RE.isOwned() ? RefVal::makeOwned() : RefVal::makeRetained());
     }
   }
 
