@@ -108,7 +108,8 @@ namespace {
 
   class UAFBugVisitor;
 
-  class RacyUAFChecker : public Checker<check::BeginFunction, check::PreCall, check::PostCall, check::Bind> {
+  class RacyUAFChecker : public Checker<check::BeginFunction, check::PreCall, check::PostCall, check::Bind,
+        eval::Call> {
     friend class UAFBugVisitor;
 
   public:
@@ -119,6 +120,8 @@ namespace {
     void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
 
     void checkBind(SVal location, SVal val, const Stmt *S, CheckerContext &C) const;
+
+    bool evalCall(const CallEvent &Call, CheckerContext &C) const;
 
   private:
     // bug types:
@@ -215,6 +218,11 @@ namespace {
       {CDM::CXXMethod, {"libkern", "intrusive_shared_ptr", "~intrusive_shared_ptr"}},
       {CDM::CXXMethod, {"libkern", "intrusive_shared_ptr", "operator="}},
       {CDM::CXXMethod, {"libkern", "intrusive_shared_ptr", "reset"}},
+    };
+
+    CallDescriptionSet SkippedFunctionBodies = {
+      {CDM::CLibrary, {"mutex_pause"}, 1},
+      {CDM::CLibrary, {"panic"}},
     };
 
     // manager returns a "summary" about what effect a call should have on the receivers' retain counts
@@ -423,6 +431,13 @@ void RacyUAFChecker::checkBind(SVal dest, SVal src, const Stmt *S, CheckerContex
     }
     C.addTransition(state);
   }
+}
+
+bool RacyUAFChecker::evalCall(const CallEvent &Call, CheckerContext &C) const {
+  // do not evaluate locking primitives implementations or skipped bodies:
+  if (SkippedFunctionBodies.contains(Call) || PostCallHandlers.lookup(Call))
+    return true;
+  return false;
 }
 
 void RacyUAFChecker::AcquireLockAux(const CallEvent &Call,
