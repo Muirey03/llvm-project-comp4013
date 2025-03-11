@@ -383,6 +383,10 @@ void RacyUAFChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) cons
 }
 
 void RacyUAFChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+  if (TrustedRCImplementations.contains(Call)) {
+    return;
+  }
+
   if (const FnCheck *Callback = PostCallHandlers.lookup(Call))
     (this->**Callback)(Call, C);
   else {
@@ -426,7 +430,6 @@ void RacyUAFChecker::AcquireLockAux(const CallEvent &Call,
                                     SVal MtxVal, bool IsTryLock,
                                     enum LockingSemantics Semantics) const {
   const MemRegion *lockR = MtxVal.getAsRegion();
-
   if (!lockR)
     return;
 
