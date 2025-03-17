@@ -502,7 +502,6 @@ void RacyUAFChecker::parseConfigFile(CheckerContext &C) const {
 
   std::vector<std::pair<CallDescription, bool> > entries;
   for (std::string fnname: Config->Entries) {
-    llvm::errs() << "loaded entry: " << fnname << "\n";
     entries.emplace_back(CallDescription(CDM::Unspecified, {fnname}), true);
   }
   ExtraEntries.emplace(
