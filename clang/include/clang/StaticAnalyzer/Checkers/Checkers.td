@@ -1048,6 +1048,13 @@ def ReturnPointerRangeChecker : Checker<"ReturnPtrRange">,
 
 def RacyUAFChecker : Checker<"RacyUAF">,
   HelpText<"Check for race conditions that could lead to use-after-free bugs">,
+  CheckerOptions<[
+    CmdLineOption<String,
+                  "Config",
+                  "Specifies the name of the configuration file.",
+                  "",
+                  InAlpha>
+  ]>,
   Documentation<NotDocumented>;
 
 } // end "alpha.security"

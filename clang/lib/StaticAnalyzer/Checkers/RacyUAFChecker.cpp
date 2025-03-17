@@ -12,6 +12,8 @@
 #include "clang/Analysis/RetainSummaryManager.h"
 #include <clang/ASTMatchers/ASTMatchers.h>
 #include <clang/ASTMatchers/ASTMatchFinder.h>
+#include "Yaml.h"
+#include "llvm/Support/YAMLTraits.h"
 
 using namespace clang;
 using namespace ento;
@@ -106,6 +108,21 @@ namespace {
     bool safe = false;
   };
 
+  /// Used to parse the configuration file.
+  struct RacyUAFConfiguration {
+    std::vector<std::string> Entries;
+
+    RacyUAFConfiguration() = default;
+
+    RacyUAFConfiguration(const RacyUAFConfiguration &) = default;
+
+    RacyUAFConfiguration(RacyUAFConfiguration &&) = default;
+
+    RacyUAFConfiguration &operator=(const RacyUAFConfiguration &) = default;
+
+    RacyUAFConfiguration &operator=(RacyUAFConfiguration &&) = default;
+  };
+
   class UAFBugVisitor;
 
   class RacyUAFChecker : public Checker<check::BeginFunction, check::PreCall, check::PostCall, check::Bind,
@@ -122,6 +139,8 @@ namespace {
     void checkBind(SVal location, SVal val, const Stmt *S, CheckerContext &C) const;
 
     bool evalCall(const CallEvent &Call, CheckerContext &C) const;
+
+    mutable std::optional<StringRef> ConfigFile;
 
   private:
     // bug types:
@@ -225,8 +244,14 @@ namespace {
       {CDM::CLibrary, {"panic"}},
     };
 
+    mutable std::optional<CallDescriptionMap<bool> > ExtraEntries;
+
     // manager returns a "summary" about what effect a call should have on the receivers' retain counts
     mutable std::unique_ptr<RetainSummaryManager> Summaries;
+
+    bool isEntry(const AnyCall &Call, CheckerContext &C) const;
+
+    void parseConfigFile(CheckerContext &C) const;
 
     RetainSummaryManager &getSummaryManager(ASTContext &Ctx) const {
       // only track OSObjects for now:
@@ -331,12 +356,28 @@ REGISTER_MAP_WITH_PROGRAMSTATE(RefBindings, SymbolRef, RefVal)
 
 REGISTER_MAP_WITH_PROGRAMSTATE(LocalRefs, const MemRegion *, LocalRef)
 
+REGISTER_SET_WITH_PROGRAMSTATE(EntryArguments, SymbolRef)
+
+// YAML config parsing:
+namespace llvm {
+  namespace yaml {
+    template<>
+    struct MappingTraits<RacyUAFConfiguration> {
+      static void mapping(IO &IO, RacyUAFConfiguration &Config) {
+        IO.mapOptional("Entrypoints", Config.Entries);
+      }
+    };
+  }
+}
+
 void RacyUAFChecker::checkBeginFunction(CheckerContext &C) const {
   const LocationContext *LC = C.getLocationContext();
   const Decl *D = LC ? LC->getDecl() : nullptr;
+  std::optional<AnyCall> Call = AnyCall::forDecl(D);
 
-  if (C.inTopFrame()) {
-    if (!D || !D->hasAttr<ThreadEntrypointAttr>()) {
+  bool inTopFrame = C.inTopFrame();
+  if (inTopFrame) {
+    if (!Call || !isEntry(*Call, C)) {
       C.addSink();
       return;
     }
@@ -438,6 +479,36 @@ bool RacyUAFChecker::evalCall(const CallEvent &Call, CheckerContext &C) const {
   if (SkippedFunctionBodies.contains(Call) || PostCallHandlers.lookup(Call))
     return true;
   return false;
+}
+
+bool RacyUAFChecker::isEntry(const AnyCall &Call, CheckerContext &C) const {
+  const Decl *D = Call.getDecl();
+  if (D && D->hasAttr<ThreadEntrypointAttr>())
+    return true;
+  if (ConfigFile) {
+    if (!ExtraEntries)
+      parseConfigFile(C);
+    const Expr *E = Call.getExpr();
+    const CallExpr *CE = dyn_cast_or_null<CallExpr>(E);
+    return CE && !!ExtraEntries->lookupAsWritten(*CE);
+  }
+  return false;
+}
+
+void RacyUAFChecker::parseConfigFile(CheckerContext &C) const {
+  CheckerManager *Mgr = C.getAnalysisManager().getCheckerManager();
+  std::optional<RacyUAFConfiguration> Config = getConfiguration<
+    RacyUAFConfiguration>(*Mgr, this, "Config", *ConfigFile);
+
+  std::vector<std::pair<CallDescription, bool> > entries;
+  for (std::string fnname: Config->Entries) {
+    llvm::errs() << "loaded entry: " << fnname << "\n";
+    entries.emplace_back(CallDescription(CDM::Unspecified, {fnname}), true);
+  }
+  ExtraEntries.emplace(
+    std::make_move_iterator(entries.begin()),
+    std::make_move_iterator(entries.end())
+  );
 }
 
 void RacyUAFChecker::AcquireLockAux(const CallEvent &Call,
@@ -1043,7 +1114,11 @@ PathDiagnosticPieceRef UAFBugVisitor::VisitNode(const ExplodedNode *N, BugReport
 }
 
 void ento::registerRacyUAFChecker(CheckerManager &mgr) {
-  mgr.registerChecker<RacyUAFChecker>();
+  auto *checker = mgr.registerChecker<RacyUAFChecker>();
+  StringRef configFile = mgr.getAnalyzerOptions().getCheckerStringOption(checker, "Config");
+  if (!configFile.empty()) {
+    checker->ConfigFile = configFile;
+  }
 }
 
 bool ento::shouldRegisterRacyUAFChecker(const CheckerManager &mgr) {
