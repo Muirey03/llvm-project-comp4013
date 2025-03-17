@@ -39,46 +39,42 @@ namespace {
 
   class RefVal {
   public:
-    RefVal(int _cnt, bool _owned) : cnt(_cnt), owned(_owned) {
-      // once the refcnt hits 0, the object is no longer owned:
-      if (_cnt == 0) {
-        setOwned(false);
-      }
+    RefVal(int _cnt, bool _unknownOrigin = false)
+      : cnt(_cnt), unknownOrigin(_unknownOrigin) {
     }
 
-    static RefVal makeDefault() { return RefVal(0, false); }
-    static RefVal makeOwned() { return RefVal(1, true); }
+    RefVal() : unknownOrigin(true) {
+    }
 
-    // functions will return a reference that is either locked or retained,
-    //  we assume retained
+    static RefVal makeUnretained() { return RefVal(0, false); }
     static RefVal makeRetained() { return RefVal(1, false); }
+    static RefVal makeUnknownOrigin() { return RefVal(); }
 
     int getCount() const { return cnt; }
     void setCount(const int newCnt) { cnt = newCnt; }
-    bool isOwned() const { return owned; }
-    void setOwned(const bool newOwned) { owned = newOwned; }
+    bool hasUnknownOrigin() const { return unknownOrigin; }
 
     RefVal operator+(const int i) const {
-      return RefVal(cnt + i, owned);
+      return RefVal(cnt + i, unknownOrigin);
     }
 
     RefVal operator-(const int i) const {
-      return RefVal(cnt - i, owned);
+      return RefVal(cnt - i, unknownOrigin);
     }
 
     // required to add to LLVM map:
     bool operator==(const RefVal &X) const {
-      return cnt == X.getCount() && owned == X.isOwned();
+      return cnt == X.getCount() && unknownOrigin == X.hasUnknownOrigin();
     }
 
     void Profile(llvm::FoldingSetNodeID &ID) const {
       ID.AddInteger(cnt);
-      ID.AddBoolean(owned);
+      ID.AddBoolean(unknownOrigin);
     }
 
   protected:
     int cnt = 0;
-    bool owned = false;
+    bool unknownOrigin = false;
   };
 
   class LocalRef {
@@ -288,8 +284,6 @@ namespace {
     ProgramStateRef updateSymbol(ProgramStateRef state, const Expr *Expr, SymbolRef sym, RefVal V, ArgEffect E,
                                  CheckerContext &C, bool &didRelease) const;
 
-    ProgramStateRef updateOutParams(ProgramStateRef state, const RetainSummary &Summ, const CallEvent &CE) const;
-
     ProgramStateRef handleSymbolReleased(ProgramStateRef state, SymbolRef sym) const;
 
     ProgramStateRef handleSymbolUnlocked(ProgramStateRef state, SymbolRef sym) const;
@@ -303,6 +297,8 @@ namespace {
     ProgramStateRef getRefBinding(ProgramStateRef State, SymbolRef Sym, const RefVal *&Val) const;
 
     ProgramStateRef setRefBinding(ProgramStateRef State, SymbolRef Sym, RefVal Val) const;
+
+    ProgramStateRef createRefBinding(ProgramStateRef State, SymbolRef Sym) const;
 
     bool shouldTrackSymbol(SymbolRef Sym) const;
 
@@ -383,21 +379,25 @@ void RacyUAFChecker::checkBeginFunction(CheckerContext &C) const {
     }
   }
 
-  // arguments should be retained if not already tracked:
-  std::optional<AnyCall> Call = AnyCall::forDecl(D);
   if (!Call)
     return;
+
   ProgramStateRef state = C.getState();
   for (unsigned idx = 0, e = Call->param_size(); idx != e; ++idx) {
     const ParmVarDecl *Param = Call->parameters()[idx];
     SymbolRef Sym = state->getSVal(state->getRegion(Param, LC)).getAsLocSymbol();
-    if (!Sym || state->get<RefBindings>(Sym)) continue;
+    if (!Sym) continue;
 
-    if (shouldTrackSymbol(Sym)) {
-      state = setRefBinding(state, Sym, RefVal::makeRetained()); // TODO
+    // if we are in the top frame, the symbol needs to be added to the set of entry arguments
+    if (inTopFrame)
+      state = state->add<EntryArguments>(Sym);
+
+    // arguments should be retained if not already tracked:
+    //  (arguments are unlikely to be untracked if this is not in the top frame, but it is possible)
+    if (!state->get<RefBindings>(Sym) && shouldTrackSymbol(Sym)) {
+      state = setRefBinding(state, Sym, RefVal::makeRetained());
     }
   }
-
   C.addTransition(state);
 }
 
@@ -655,17 +655,7 @@ void RacyUAFChecker::checkSummary(const RetainSummary &Summ, const CallEvent &Ca
     }
   }
 
-  // evaluate effect on the return value:
-  RetEffect RE = Summ.getRetEffect();
-  if (SymbolRef Sym = Call.getReturnValue().getAsSymbol()) {
-    // if we are already tracking this symbol, don't replace it with what may be a default RetEffect
-    if (shouldTrackSymbol(Sym) && !state->get<RefBindings>(Sym)) {
-      state = setRefBinding(state, Sym, RE.isOwned() ? RefVal::makeOwned() : RefVal::makeRetained());
-    }
-  }
-
-  // evaluate effect on out parameters:
-  state = updateOutParams(state, Summ, Call);
+  // all untracked returned objects are seen as having an "unknown origin", so we do not need to evaluate the return effect
 
   C.addTransition(state);
 }
@@ -675,9 +665,8 @@ ProgramStateRef RacyUAFChecker::checkVariableAccess(ProgramStateRef state, const
   if (sym && Expr) {
     const RefVal *globalRef = nullptr;
     state = getRefBinding(state, sym, globalRef);
-    if (globalRef) {
-      bool isSafe = globalRef->isOwned() || globalRef->getCount() > 0 || !findLocksProtectingSymbol(state, sym).
-                    empty();
+    if (globalRef && !globalRef->hasUnknownOrigin()) {
+      bool isSafe = globalRef->getCount() > 0 || !findLocksProtectingSymbol(state, sym).empty();
 
       // if this is a stack variable access, ensure the stack variable is safe too:
       if (isSafe && var) {
@@ -698,6 +687,7 @@ ProgramStateRef RacyUAFChecker::checkVariableAccess(ProgramStateRef state, const
 ProgramStateRef RacyUAFChecker::updateSymbol(ProgramStateRef state, const Expr *Expr, SymbolRef sym, RefVal V,
                                              ArgEffect AE, CheckerContext &C, bool &didRelease) const {
   // TODO: don't perform update if V is marked as "stop tracking"
+  if (V.hasUnknownOrigin()) return state;
 
   int oldCount = V.getCount();
 
@@ -712,8 +702,6 @@ ProgramStateRef RacyUAFChecker::updateSymbol(ProgramStateRef state, const Expr *
     case Dealloc:
       // TODO: is there any need to track ::free()?
       V.setCount(0);
-      V.setOwned(false);
-
       llvm::dbgs() << "dealloc: " << sym << "\n"; // DEBUG
       break;
 
@@ -741,13 +729,10 @@ ProgramStateRef RacyUAFChecker::updateSymbol(ProgramStateRef state, const Expr *
 
     case DecRef:
     case DecRefAndStopTrackingHard:
-      assert(V.getCount() > 0 || !V.isOwned());
-
       if (AE.getKind() == DecRefAndStopTrackingHard) {
         // TODO: mark V as no longer tracking
       }
 
-    // if this drops the refcnt to 0, `owned` will be set to false
       V = V - 1;
     // we don't report a bug if the refcnt goes below 0,
     //  as we could be releasing some global/unowned object
@@ -761,33 +746,8 @@ ProgramStateRef RacyUAFChecker::updateSymbol(ProgramStateRef state, const Expr *
     didRelease = true;
   }
 
+  // TODO: CHECKME: is it possible that RefBindings[sym] != V? (eg. V came from one of sym's parents)
   return setRefBinding(state, sym, V);
-}
-
-ProgramStateRef RacyUAFChecker::updateOutParams(ProgramStateRef state, const RetainSummary &Summ,
-                                                const CallEvent &CE) const {
-  for (unsigned idx = 0, e = CE.getNumArgs(); idx != e; ++idx) {
-    SVal ArgVal = CE.getArgSVal(idx);
-    ArgEffect AE = Summ.getArg(idx);
-
-    auto *ArgRegion = dyn_cast_or_null<TypedValueRegion>(ArgVal.getAsRegion());
-    if (!ArgRegion)
-      continue;
-
-    SVal PointeeVal = state->getSVal(ArgRegion);
-    SymbolRef Sym = PointeeVal.getAsLocSymbol();
-    if (!Sym)
-      continue;
-
-    // TODO: handle splitting on return value correctly
-    if (AE.getKind() == UnretainedOutParameter) {
-      state = setRefBinding(state, Sym, RefVal::makeRetained());
-    } else if (AE.getKind() == RetainedOutParameter || AE.getKind() == RetainedOutParameterOnZero || AE.getKind() ==
-               RetainedOutParameterOnNonZero) {
-      state = setRefBinding(state, Sym, RefVal::makeOwned());
-    }
-  }
-  return state;
 }
 
 ProgramStateRef RacyUAFChecker::handleSymbolReleased(ProgramStateRef state, SymbolRef sym) const {
@@ -861,12 +821,16 @@ void RacyUAFChecker::reportBug(CheckerContext &C, const BugType &bugType, const 
 }
 
 ProgramStateRef RacyUAFChecker::getRefBinding(ProgramStateRef State, SymbolRef Sym, const RefVal *&Val) const {
+  // this is called on a symbol to find our state information about it, primarily its refcnt
+  // the rules for retrieving this information are as follows:
+  // - if Sym is already directly tracked, just return the RefVal from the state
+  // - otherwise, walk up the parent chain until we find a symbol that should be tracked, and create a new RefVal for that
   const RefVal *V = nullptr;
   for (; Sym; Sym = getParentSymbol(Sym)) {
     if (shouldTrackSymbol(Sym)) {
       V = State->get<RefBindings>(Sym);
       if (!V) {
-        State = State->set<RefBindings>(Sym, RefVal::makeDefault());
+        State = createRefBinding(State, Sym);
         V = State->get<RefBindings>(Sym);
       }
       break;
@@ -879,6 +843,36 @@ ProgramStateRef RacyUAFChecker::getRefBinding(ProgramStateRef State, SymbolRef S
 ProgramStateRef RacyUAFChecker::setRefBinding(ProgramStateRef State, SymbolRef Sym, RefVal Val) const {
   assert(Sym != nullptr);
   return State->set<RefBindings>(Sym, Val);
+}
+
+ProgramStateRef RacyUAFChecker::createRefBinding(ProgramStateRef State, SymbolRef forSym) const {
+  // this creates a ref binding for a previously untracked symbol.
+  // The goal of this function is to determine whether the symbol can be raced.
+  // - If the symbol can be raced, it should start with a refcnt of 0
+  // - Otherwise, we create a dummy RefVal for it that indicates it should not be tracked
+  if (!forSym) return State;
+
+  bool derivedFromEntryArg = false;
+  SymbolRef rootSym = nullptr;
+  // A symbol can be raced if it is derived from one of the entrypoint arguments or a global:
+  for (SymbolRef sym = forSym; sym; sym = getParentSymbol(sym)) {
+    rootSym = sym;
+    if (State->contains<EntryArguments>(sym)) {
+      derivedFromEntryArg = true;
+      break;
+    }
+  }
+  bool derivedFromGlobal = false;
+  if (!derivedFromEntryArg) {
+    // not derived from an entrypoint argument, check if the root symbol is in the global scope:
+    const MemSpaceRegion *memSpace = getSymbolMemorySpace(rootSym);
+    if (dyn_cast_or_null<GlobalsSpaceRegion>(memSpace)) {
+      derivedFromGlobal = true;
+    }
+  }
+  bool raceable = derivedFromEntryArg || derivedFromGlobal;
+  State = State->set<RefBindings>(forSym, raceable ? RefVal::makeUnretained() : RefVal::makeUnknownOrigin());
+  return State;
 }
 
 static bool isSubclass(const Decl *D, StringRef ClassName) {
