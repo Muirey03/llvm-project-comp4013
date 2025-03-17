@@ -800,7 +800,8 @@ ProgramStateRef RacyUAFChecker::markReferencesToSymbolUnsafe(ProgramStateRef sta
     SymbolRef localRefSym = localRefSVal.getAsLocSymbol();
     // instead of checking for exact equality here, check if the localRefSymbol is *encapsulated* within sym.
     //  this way, we also mark object's fields that were stored on the stack as unsafe
-    if (localRefSym && isDerivedSymbol(localRefSym, sym)) {
+    //  we only do this if localRefSym is not something we track, otherwise the rest of the tracking rules will handle this case
+    if (localRefSym && (localRefSym == sym || (!shouldTrackSymbol(localRefSym) && isDerivedSymbol(localRefSym, sym)))) {
       localRef.markUnsafe();
       state = state->set<LocalRefs>(memRegion, localRef);
     }
