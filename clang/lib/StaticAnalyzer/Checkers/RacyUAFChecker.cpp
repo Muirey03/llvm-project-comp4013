@@ -913,6 +913,7 @@ SmallLockSet RacyUAFChecker::findLocksProtectingSymbol(ProgramStateRef State,
     if ((lockSymBase = lockR->getSymbolicBase())) {
       // if lock is a member of a symbolic region, sym is locked if it is derived from that region's symbol
       SymbolRef lockedSym = lockSymBase->getSymbol();
+      // TODO: optimisation: would this be more efficient if we looped over sym's parent chain and checked if it contained any locked syms?
       if (isDerivedSymbol(sym, lockedSym)) {
         locks.insert(lockR);
       }
@@ -986,14 +987,14 @@ const MemSpaceRegion *RacyUAFChecker::getSymbolMemorySpace(SymbolRef sym) const 
   const MemRegion *R = sym->getOriginRegion();
   const MemSpaceRegion *space = nullptr;
   while (R) {
-    space = dyn_cast_or_null<MemSpaceRegion>(R);
+    space = dyn_cast<MemSpaceRegion>(R);
 
     const SymbolicRegion *symR;
     const SubRegion *subR;
 
-    if (((symR = dyn_cast_or_null<SymbolicRegion>(R))) && ((sym = symR->getSymbol()))) {
+    if (((symR = dyn_cast<SymbolicRegion>(R))) && ((sym = symR->getSymbol()))) {
       R = sym->getOriginRegion();
-    } else if ((subR = dyn_cast_or_null<SubRegion>(R))) {
+    } else if ((subR = dyn_cast<SubRegion>(R))) {
       R = subR->getSuperRegion();
     } else {
       break;
