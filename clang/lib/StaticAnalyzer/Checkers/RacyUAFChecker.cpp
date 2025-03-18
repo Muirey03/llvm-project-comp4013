@@ -37,6 +37,18 @@ namespace {
     }
   };
 
+  // fake CallExpr to use with CallDescriptions when a real CallExpr is not available:
+  class DummyFunctionCall : public AnyFunctionCall {
+  public:
+    DummyFunctionCall(const Decl *D) : AnyFunctionCall(D, nullptr, nullptr, CFGBlock::ConstCFGElementRef(nullptr, 0)) {
+    }
+
+    void cloneTo(void *Dest) const override { assert(false); }
+    Kind getKind() const override { return CE_Function; }
+    StringRef getKindAsString() const override { return "DummyFunctionCall"; }
+    unsigned getNumArgs() const override { return 0; }
+  };
+
   class RefVal {
   public:
     RefVal(int _cnt, bool _unknownOrigin = false)
@@ -488,9 +500,9 @@ bool RacyUAFChecker::isEntry(const AnyCall &Call, CheckerContext &C) const {
   if (ConfigFile) {
     if (!ExtraEntries)
       parseConfigFile(C);
-    const Expr *E = Call.getExpr();
-    const CallExpr *CE = dyn_cast_or_null<CallExpr>(E);
-    return CE && !!ExtraEntries->lookupAsWritten(*CE);
+
+    DummyFunctionCall CE(D);
+    return !!ExtraEntries->lookup(CE);
   }
   return false;
 }
