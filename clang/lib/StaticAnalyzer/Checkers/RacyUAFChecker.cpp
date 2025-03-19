@@ -14,6 +14,7 @@
 #include <clang/ASTMatchers/ASTMatchFinder.h>
 #include "Yaml.h"
 #include "llvm/Support/YAMLTraits.h"
+#include "llvm/Support/JSON.h"
 
 using namespace clang;
 using namespace ento;
@@ -119,6 +120,7 @@ namespace {
   /// Used to parse the configuration file.
   struct RacyUAFConfiguration {
     std::vector<std::string> Entries;
+    bool DumpCoverage = false;
 
     RacyUAFConfiguration() = default;
 
@@ -133,11 +135,18 @@ namespace {
 
   class UAFBugVisitor;
 
+  struct CoverageData {
+    std::map<std::string, std::map<unsigned, unsigned> > visitedLines;
+  };
+
   class RacyUAFChecker : public Checker<check::BeginFunction, check::PreCall, check::PostCall, check::Bind,
-        eval::Call> {
+        eval::Call, check::PreStmt<Stmt>,
+        check::EndOfTranslationUnit> {
     friend class UAFBugVisitor;
 
   public:
+    void parseConfigFile(CheckerManager &mgr, StringRef configFile);
+
     void checkBeginFunction(CheckerContext &C) const;
 
     void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
@@ -148,7 +157,9 @@ namespace {
 
     bool evalCall(const CallEvent &Call, CheckerContext &C) const;
 
-    mutable std::optional<StringRef> ConfigFile;
+    void checkPreStmt(const Stmt *S, CheckerContext &C) const;
+
+    void checkEndOfTranslationUnit(const TranslationUnitDecl *TU, AnalysisManager &mgr, BugReporter &BR) const;
 
   private:
     // bug types:
@@ -252,14 +263,17 @@ namespace {
       {CDM::CLibrary, {"panic"}},
     };
 
-    mutable std::optional<CallDescriptionMap<bool> > ExtraEntries;
+    // config:
+    std::optional<CallDescriptionMap<bool> > ExtraEntries;
+    bool DumpCoverage = false;
+
+    // coverage information:
+    mutable CoverageData Coverage;
 
     // manager returns a "summary" about what effect a call should have on the receivers' retain counts
     mutable std::unique_ptr<RetainSummaryManager> Summaries;
 
     bool isEntry(const AnyCall &Call, CheckerContext &C) const;
-
-    void parseConfigFile(CheckerContext &C) const;
 
     RetainSummaryManager &getSummaryManager(ASTContext &Ctx) const {
       // only track OSObjects for now:
@@ -373,6 +387,7 @@ namespace llvm {
     struct MappingTraits<RacyUAFConfiguration> {
       static void mapping(IO &IO, RacyUAFConfiguration &Config) {
         IO.mapOptional("Entrypoints", Config.Entries);
+        IO.mapOptional("DumpCoverage", Config.DumpCoverage);
       }
     };
   }
@@ -497,20 +512,15 @@ bool RacyUAFChecker::isEntry(const AnyCall &Call, CheckerContext &C) const {
   const Decl *D = Call.getDecl();
   if (D && D->hasAttr<ThreadEntrypointAttr>())
     return true;
-  if (ConfigFile) {
-    if (!ExtraEntries)
-      parseConfigFile(C);
-
+  if (ExtraEntries) {
     DummyFunctionCall CE(D);
     return !!ExtraEntries->lookup(CE);
   }
   return false;
 }
 
-void RacyUAFChecker::parseConfigFile(CheckerContext &C) const {
-  CheckerManager *Mgr = C.getAnalysisManager().getCheckerManager();
-  std::optional<RacyUAFConfiguration> Config = getConfiguration<
-    RacyUAFConfiguration>(*Mgr, this, "Config", *ConfigFile);
+void RacyUAFChecker::parseConfigFile(CheckerManager &mgr, StringRef configFile) {
+  std::optional<RacyUAFConfiguration> Config = getConfiguration<RacyUAFConfiguration>(mgr, this, "Config", configFile);
 
   std::vector<std::pair<CallDescription, bool> > entries;
   for (std::string fnname: Config->Entries) {
@@ -520,6 +530,7 @@ void RacyUAFChecker::parseConfigFile(CheckerContext &C) const {
     std::make_move_iterator(entries.begin()),
     std::make_move_iterator(entries.end())
   );
+  DumpCoverage = Config->DumpCoverage;
 }
 
 void RacyUAFChecker::AcquireLockAux(const CallEvent &Call,
@@ -1120,11 +1131,77 @@ PathDiagnosticPieceRef UAFBugVisitor::VisitNode(const ExplodedNode *N, BugReport
   return std::make_shared<PathDiagnosticEventPiece>(Pos, OS.str(), true);
 }
 
+void RacyUAFChecker::checkPreStmt(const Stmt *S, CheckerContext &C) const {
+  // record coverage information:
+  if (!DumpCoverage || !S)
+    return;
+
+  const SourceManager &SM = C.getSourceManager();
+  SourceLocation Loc = S->getBeginLoc();
+  if (Loc.isInvalid() || Loc.isMacroID())
+    return;
+
+  StringRef Filename = SM.getFilename(Loc);
+  unsigned LineNo = SM.getLineNumber(SM.getFileID(Loc), SM.getFileOffset(Loc));
+  Coverage.visitedLines[Filename.str()][LineNo]++;
+}
+
+void RacyUAFChecker::checkEndOfTranslationUnit(const TranslationUnitDecl *TU, AnalysisManager &mgr,
+                                               BugReporter &BR) const {
+  if (!DumpCoverage)
+    return;
+
+  // generate coverage JSON data:
+  llvm::json::Object coverageJson;
+  coverageJson["gcovr/format_version"] = "0.11";
+
+  llvm::json::Array files;
+  for (const auto &filePair: Coverage.visitedLines) {
+    const std::string &filename = filePair.first;
+    const std::map<unsigned, unsigned> &lines = filePair.second;
+
+    llvm::json::Object fileObj;
+    fileObj["file"] = filename;
+
+    llvm::json::Array linesArr;
+    for (const auto &line: lines) {
+      llvm::json::Object lineObj;
+      lineObj["line_number"] = line.first;
+      lineObj["count"] = line.second;
+      lineObj["branches"] = llvm::json::Array();
+      linesArr.push_back(std::move(lineObj));
+    }
+    fileObj["lines"] = std::move(linesArr);
+    fileObj["functions"] = llvm::json::Array();
+
+    files.push_back(std::move(fileObj));
+  }
+  coverageJson["files"] = std::move(files);
+
+  // write coverage data to file:
+  SmallString<128> Str;
+  llvm::raw_svector_ostream SS(Str);
+  const SourceManager &SM = BR.getSourceManager();
+  FileID MainFileID = SM.getMainFileID();
+  const FileEntry *ent = SM.getFileEntryForID(MainFileID);
+  SS << "coverage_" << llvm::format_hex_no_prefix(ent->getUniqueID().getFile(), 16) << ".json";
+  StringRef filename = SS.str();
+  std::error_code EC;
+  llvm::raw_fd_ostream OS(filename, EC);
+  if (EC) {
+    llvm::errs() << "Error opening " << filename << ": " << EC.message() << "\n";
+    return;
+  }
+  OS << llvm::formatv("{0:2}", llvm::json::Value(std::move(coverageJson)));
+  OS.close();
+  llvm::dbgs() << "Coverage information for " << ent->tryGetRealPathName() << " written to " << filename << ".\n";
+}
+
 void ento::registerRacyUAFChecker(CheckerManager &mgr) {
   auto *checker = mgr.registerChecker<RacyUAFChecker>();
   StringRef configFile = mgr.getAnalyzerOptions().getCheckerStringOption(checker, "Config");
   if (!configFile.empty()) {
-    checker->ConfigFile = configFile;
+    checker->parseConfigFile(mgr, configFile);
   }
 }
 
