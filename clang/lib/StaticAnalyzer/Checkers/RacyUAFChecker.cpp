@@ -337,6 +337,8 @@ namespace {
 
     SymbolRef getParentSymbol(SymbolRef sym) const;
 
+    const MemRegion *getParentRegion(const MemRegion *R) const;
+
     bool isDerivedSymbol(SymbolRef sym, SymbolRef baseSymbol) const;
 
     const MemSpaceRegion *getSymbolMemorySpace(SymbolRef sym) const;
@@ -930,30 +932,33 @@ bool RacyUAFChecker::shouldTrackSymbol(SymbolRef Sym) const {
   return false;
 }
 
+template<class T>
+inline bool doSetsIntersect(T &setA, T &setB) {
+  for (const auto &v: setA) {
+    if (setB.contains(v)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 SmallLockSet RacyUAFChecker::findLocksProtectingSymbol(ProgramStateRef State,
                                                        SymbolRef sym) const {
   SmallLockSet locks;
 
-  // TODO: optimisation: we only need to get the symbol memory space when we first encounter a global lock
-  //  ie. when lockR->getSymbolicBase() == nullptr
-  const MemSpaceRegion *symMemSpace = getSymbolMemorySpace(sym);
+  llvm::SmallSet<const MemRegion *, 8> symParents;
+  for (const MemRegion *parent = sym->getOriginRegion(); parent; parent = getParentRegion(parent)) {
+    symParents.insert(parent);
+  }
 
   llvm::ImmutableSet<const MemRegion *> allLocks = State->get<LockSet>();
   for (const MemRegion *lockR: allLocks) {
-    const SymbolicRegion *lockSymBase;
-    if ((lockSymBase = lockR->getSymbolicBase())) {
-      // if lock is a member of a symbolic region, sym is locked if it is derived from that region's symbol
-      SymbolRef lockedSym = lockSymBase->getSymbol();
-      // TODO: optimisation: would this be more efficient if we looped over sym's parent chain and checked if it contained any locked syms?
-      if (isDerivedSymbol(sym, lockedSym)) {
-        locks.insert(lockR);
-      }
-    } else if (symMemSpace) {
-      // if lock is a global region, sym is locked if it is derived from a global region in the same translation unit
-      // TODO: optimisation: lockR cannot be a subregion of symMemSpace is symMemSpace is "Unknown"
-      if (lockR->isSubRegionOf(symMemSpace)) {
-        locks.insert(lockR);
-      }
+    llvm::SmallSet<const MemRegion *, 8> lockParents;
+    for (const MemRegion *parent = lockR; parent; parent = getParentRegion(parent)) {
+      lockParents.insert(parent);
+    }
+    if (doSetsIntersect(symParents, lockParents)) {
+      locks.insert(lockR);
     }
   }
 
@@ -1003,6 +1008,17 @@ SymbolRef RacyUAFChecker::getParentSymbol(SymbolRef sym) const {
     parentSym = nullptr;
   }
   return parentSym;
+}
+
+const MemRegion *RacyUAFChecker::getParentRegion(const MemRegion *R) const {
+  const auto *SubR = dyn_cast<SubRegion>(R);
+  if (SubR) {
+    if (const auto *SymR = dyn_cast<SymbolicRegion>(SubR)) {
+      return SymR->getSymbol()->getOriginRegion();
+    }
+    return SubR->getSuperRegion();
+  }
+  return nullptr;
 }
 
 bool RacyUAFChecker::isDerivedSymbol(SymbolRef sym, SymbolRef baseSymbol) const {
