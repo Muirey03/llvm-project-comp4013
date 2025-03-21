@@ -263,6 +263,16 @@ namespace {
       {CDM::CLibrary, {"panic"}},
     };
 
+    // singleton classes:
+#define CLASS_MATCH(name) ast_matchers::isSameOrDerivedFrom(std::string(name))
+    ast_matchers::internal::BindableMatcher<Decl> SingletonMatcher =
+        ast_matchers::cxxRecordDecl(ast_matchers::anyOf(
+          CLASS_MATCH("OSMetaClass"),
+          CLASS_MATCH("OSSymbol"),
+          CLASS_MATCH("OSBoolean")
+        ));
+#undef CLASS_MATCH
+
     // config:
     std::optional<CallDescriptionMap<bool> > ExtraEntries;
     bool DumpCoverage = false;
@@ -327,6 +337,8 @@ namespace {
     ProgramStateRef createRefBinding(ProgramStateRef State, SymbolRef Sym) const;
 
     bool shouldTrackSymbol(SymbolRef Sym) const;
+
+    bool isSingleton(SymbolRef Sym) const;
 
     SmallLockSet findLocksProtectingSymbol(ProgramStateRef State, SymbolRef Sym) const;
 
@@ -502,6 +514,7 @@ void RacyUAFChecker::checkBind(SVal dest, SVal src, const Stmt *S, CheckerContex
       state = state->set<LocalRefs>(destVar, destLocalRef);
     }
   } else if (const auto *srcInt = src.getAsInteger()) {
+    // TODO: shouldn't this be for any assignment, not just nullptrs?
     if (srcInt->isZero()) {
       // when a shared reference is set to nullptr, its reference is converted into a stack ref:
       if (SymbolRef dstSym = state->getSVal(destVar).getAsLocSymbol()) {
@@ -894,24 +907,29 @@ ProgramStateRef RacyUAFChecker::createRefBinding(ProgramStateRef State, SymbolRe
   if (!forSym) return State;
 
   bool derivedFromEntryArg = false;
+  bool derivedFromSingleton = false;
   SymbolRef rootSym = nullptr;
   // A symbol can be raced if it is derived from one of the entrypoint arguments or a global:
   for (SymbolRef sym = forSym; sym; sym = getParentSymbol(sym)) {
     rootSym = sym;
+    if (isSingleton(sym)) {
+      derivedFromSingleton = true;
+      break;
+    }
     if (State->contains<EntryArguments>(sym)) {
       derivedFromEntryArg = true;
       break;
     }
   }
   bool derivedFromGlobal = false;
-  if (!derivedFromEntryArg) {
+  if (!derivedFromEntryArg && !derivedFromSingleton) {
     // not derived from an entrypoint argument, check if the root symbol is in the global scope:
     const MemSpaceRegion *memSpace = getSymbolMemorySpace(rootSym);
     if (dyn_cast_or_null<GlobalsSpaceRegion>(memSpace)) {
       derivedFromGlobal = true;
     }
   }
-  bool raceable = derivedFromEntryArg || derivedFromGlobal;
+  bool raceable = (derivedFromEntryArg || derivedFromGlobal) && !derivedFromSingleton;
   State = State->set<RefBindings>(forSym, raceable ? RefVal::makeUnretained() : RefVal::makeUnknownOrigin());
   return State;
 }
@@ -929,6 +947,18 @@ bool RacyUAFChecker::shouldTrackSymbol(SymbolRef Sym) const {
     if (pointeeT->isRecordType()) {
       RecordDecl *RD = pointeeT->castAs<RecordType>()->getDecl();
       return RD->hasAttr<OwnershipTrackedAttr>() || isSubclass(RD, "OSMetaClassBase");
+    }
+  }
+  return false;
+}
+
+bool RacyUAFChecker::isSingleton(SymbolRef Sym) const {
+  QualType T = Sym->getType();
+  if (T->isPointerType()) {
+    QualType pointeeT = T->getPointeeType();
+    if (pointeeT->isRecordType()) {
+      RecordDecl *D = pointeeT->castAs<RecordType>()->getDecl();
+      return !ast_matchers::match(SingletonMatcher, *D, D->getASTContext()).empty();
     }
   }
   return false;
