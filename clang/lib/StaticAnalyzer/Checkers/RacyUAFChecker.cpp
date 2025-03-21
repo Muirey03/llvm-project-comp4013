@@ -482,6 +482,8 @@ void RacyUAFChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) con
 void RacyUAFChecker::checkBind(SVal dest, SVal src, const Stmt *S, CheckerContext &C) const {
   ProgramStateRef state = C.getState();
   const MemRegion *destVar = dest.getAsRegion();
+  if (!destVar) return;
+
   if (SymbolRef srcSym = src.getAsLocSymbol()) {
     const RefVal *srcGlobalRef = nullptr;
     state = getRefBinding(state, srcSym, srcGlobalRef);
@@ -500,7 +502,7 @@ void RacyUAFChecker::checkBind(SVal dest, SVal src, const Stmt *S, CheckerContex
       state = state->set<LocalRefs>(destVar, destLocalRef);
     }
   } else if (const auto *srcInt = src.getAsInteger()) {
-    if (destVar && srcInt->isZero()) {
+    if (srcInt->isZero()) {
       // when a shared reference is set to nullptr, its reference is converted into a stack ref:
       if (SymbolRef dstSym = state->getSVal(destVar).getAsLocSymbol()) {
         const RefVal *destGlobalRef = nullptr;
