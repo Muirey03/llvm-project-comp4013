@@ -269,7 +269,8 @@ namespace {
         ast_matchers::cxxRecordDecl(ast_matchers::anyOf(
           CLASS_MATCH("OSMetaClass"),
           CLASS_MATCH("OSSymbol"),
-          CLASS_MATCH("OSBoolean")
+          CLASS_MATCH("OSBoolean"),
+          CLASS_MATCH("IOCatalogue")
         ));
 #undef CLASS_MATCH
 
@@ -336,9 +337,13 @@ namespace {
 
     ProgramStateRef createRefBinding(ProgramStateRef State, SymbolRef Sym) const;
 
+    RecordDecl *getSymbolPointeeTypeDecl(SymbolRef sym) const;
+
+    RecordDecl *getRegionPointeeTypeDecl(const MemRegion *R) const;
+
     bool shouldTrackSymbol(SymbolRef Sym) const;
 
-    bool isSingleton(SymbolRef Sym) const;
+    bool isSingleton(Decl *D) const;
 
     SmallLockSet findLocksProtectingSymbol(ProgramStateRef State, SymbolRef Sym) const;
 
@@ -906,19 +911,32 @@ ProgramStateRef RacyUAFChecker::createRefBinding(ProgramStateRef State, SymbolRe
   // - Otherwise, we create a dummy RefVal for it that indicates it should not be tracked
   if (!forSym) return State;
 
-  bool derivedFromEntryArg = false;
+  bool derivedFromEntryArg = State->contains<EntryArguments>(forSym);
   bool derivedFromSingleton = false;
-  SymbolRef rootSym = nullptr;
-  // A symbol can be raced if it is derived from one of the entrypoint arguments or a global:
-  for (SymbolRef sym = forSym; sym; sym = getParentSymbol(sym)) {
-    rootSym = sym;
-    if (isSingleton(sym)) {
+  SymbolRef rootSym = forSym;
+
+  if (auto *RD = getSymbolPointeeTypeDecl(forSym)) {
+    derivedFromSingleton = isSingleton(RD);
+  }
+
+  // A symbol can be raced if it is derived from one of the entrypoint arguments or a global
+  //  and it is not derived from a singleton
+  for (const MemRegion *parent = forSym->getOriginRegion(); parent && !derivedFromSingleton && !derivedFromEntryArg;
+       parent = getParentRegion(parent)) {
+    // check if this region is for a singleton type:
+    Decl *D = getRegionPointeeTypeDecl(parent);
+    if (isSingleton(D)) {
       derivedFromSingleton = true;
       break;
     }
-    if (State->contains<EntryArguments>(sym)) {
-      derivedFromEntryArg = true;
-      break;
+    // check if this region is a SymRegion for an entry symbol:
+    if (const auto *SymR = dyn_cast<SymbolicRegion>(parent)) {
+      SymbolRef sym = SymR->getSymbol();
+      rootSym = sym;
+      if (State->contains<EntryArguments>(sym)) {
+        derivedFromEntryArg = true;
+        break;
+      }
     }
   }
   bool derivedFromGlobal = false;
@@ -940,28 +958,37 @@ static bool isSubclass(const Decl *D, StringRef ClassName) {
   return !(match(SubclassM, *D, D->getASTContext()).empty());
 }
 
-bool RacyUAFChecker::shouldTrackSymbol(SymbolRef Sym) const {
-  QualType T = Sym->getType();
+RecordDecl *RacyUAFChecker::getSymbolPointeeTypeDecl(SymbolRef sym) const {
+  QualType T = sym->getType();
   if (T->isPointerType()) {
     QualType pointeeT = T->getPointeeType();
     if (pointeeT->isRecordType()) {
-      RecordDecl *RD = pointeeT->castAs<RecordType>()->getDecl();
-      return RD->hasAttr<OwnershipTrackedAttr>() || isSubclass(RD, "OSMetaClassBase");
+      return pointeeT->castAs<RecordType>()->getDecl();
     }
   }
-  return false;
+  return nullptr;
 }
 
-bool RacyUAFChecker::isSingleton(SymbolRef Sym) const {
-  QualType T = Sym->getType();
-  if (T->isPointerType()) {
-    QualType pointeeT = T->getPointeeType();
-    if (pointeeT->isRecordType()) {
-      RecordDecl *D = pointeeT->castAs<RecordType>()->getDecl();
-      return !ast_matchers::match(SingletonMatcher, *D, D->getASTContext()).empty();
+RecordDecl *RacyUAFChecker::getRegionPointeeTypeDecl(const MemRegion *R) const {
+  if (const TypedRegion *TR = dyn_cast_or_null<TypedRegion>(R)) {
+    QualType T = TR->getLocationType();
+    if (T->isPointerType()) {
+      QualType pointeeT = T->getPointeeType();
+      if (pointeeT->isRecordType()) {
+        return pointeeT->castAs<RecordType>()->getDecl();
+      }
     }
   }
-  return false;
+  return nullptr;
+}
+
+bool RacyUAFChecker::shouldTrackSymbol(SymbolRef Sym) const {
+  RecordDecl *RD = getSymbolPointeeTypeDecl(Sym);
+  return RD && (RD->hasAttr<OwnershipTrackedAttr>() || isSubclass(RD, "OSMetaClassBase"));
+}
+
+bool RacyUAFChecker::isSingleton(Decl *D) const {
+  return D && !ast_matchers::match(SingletonMatcher, *D, D->getASTContext()).empty();
 }
 
 template<class T>
