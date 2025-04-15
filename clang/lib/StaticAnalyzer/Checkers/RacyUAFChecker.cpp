@@ -190,6 +190,10 @@ namespace {
         &RacyUAFChecker::AcquireXNULock
       },
       {
+        {CDM::CLibrary, {"lck_ticket_lock"}, 1},
+        &RacyUAFChecker::AcquireXNULock
+      },
+      {
         {CDM::CLibrary, {"lck_rw_lock_exclusive"}, 1},
         &RacyUAFChecker::AcquireXNULock
       },
@@ -235,6 +239,10 @@ namespace {
       },
       {
         {CDM::CLibrary, {"lck_mtx_unlock"}, 1},
+        &RacyUAFChecker::ReleaseLock
+      },
+      {
+        {CDM::CLibrary, {"lck_ticket_unlock"}, 1},
         &RacyUAFChecker::ReleaseLock
       },
       {
