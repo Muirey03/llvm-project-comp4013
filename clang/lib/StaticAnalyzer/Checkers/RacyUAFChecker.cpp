@@ -526,18 +526,14 @@ void RacyUAFChecker::checkBind(SVal dest, SVal src, const Stmt *S, CheckerContex
       LocalRef destLocalRef = LocalRef::make(srcLocalRef, *srcGlobalRef, !locks.empty());
       state = state->set<LocalRefs>(destVar, destLocalRef);
     }
-  } else if (const auto *srcInt = src.getAsInteger()) {
-    // TODO: shouldn't this be for any assignment, not just nullptrs?
-    if (srcInt->isZero()) {
-      // when a shared reference is set to nullptr, its reference is converted into a stack ref:
-      if (SymbolRef dstSym = state->getSVal(destVar).getAsLocSymbol()) {
-        const RefVal *destGlobalRef = nullptr;
-        state = getRefBinding(state, dstSym, destGlobalRef);
-        if (destGlobalRef) {
-          const MemSpaceRegion *destSpace = destVar->getMemorySpace();
-          if (!isa<StackSpaceRegion>(destSpace)) {
-            state = setRefBinding(state, dstSym, *destGlobalRef + 1);
-          }
+  } else if (SymbolRef dstSym = state->getSVal(destVar).getAsLocSymbol()) {
+    if (dstSym != srcSym) {
+      const RefVal *destGlobalRef = nullptr;
+      state = getRefBinding(state, dstSym, destGlobalRef);
+      if (destGlobalRef) {
+        const MemSpaceRegion *destSpace = destVar->getMemorySpace();
+        if (!isa<StackSpaceRegion>(destSpace)) {
+          state = setRefBinding(state, dstSym, *destGlobalRef + 1);
         }
       }
     }
