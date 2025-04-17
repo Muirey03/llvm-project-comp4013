@@ -269,6 +269,9 @@ namespace {
     CallDescriptionSet SkippedFunctionBodies = {
       {CDM::CLibrary, {"mutex_pause"}, 1},
       {CDM::CLibrary, {"panic"}},
+      {CDM::CLibrary, {"ipc_port_release_send"}},
+      {CDM::CLibrary, {"vm_shared_region_deallocate"}},
+      {CDM::CLibrary, {"ipc_kmsg_free"}},
     };
 
     // singleton classes:
@@ -351,7 +354,9 @@ namespace {
 
     bool shouldTrackSymbol(SymbolRef Sym) const;
 
-    bool isSingleton(Decl *D) const;
+    bool isSingletonType(Decl *D) const;
+
+    bool isSingletonRegion(const MemRegion *R) const;
 
     SmallLockSet findLocksProtectingSymbol(ProgramStateRef State, SymbolRef Sym) const;
 
@@ -920,7 +925,7 @@ ProgramStateRef RacyUAFChecker::createRefBinding(ProgramStateRef State, SymbolRe
   SymbolRef rootSym = forSym;
 
   if (auto *RD = getSymbolPointeeTypeDecl(forSym)) {
-    derivedFromSingleton = isSingleton(RD);
+    derivedFromSingleton = isSingletonType(RD);
   }
 
   // A symbol can be raced if it is derived from one of the entrypoint arguments or a global
@@ -929,7 +934,7 @@ ProgramStateRef RacyUAFChecker::createRefBinding(ProgramStateRef State, SymbolRe
        parent = getParentRegion(parent)) {
     // check if this region is for a singleton type:
     Decl *D = getRegionPointeeTypeDecl(parent);
-    if (isSingleton(D)) {
+    if (isSingletonType(D) || isSingletonRegion(parent)) {
       derivedFromSingleton = true;
       break;
     }
@@ -991,8 +996,20 @@ bool RacyUAFChecker::shouldTrackSymbol(SymbolRef Sym) const {
   return RD && (RD->hasAttr<OwnershipTrackedAttr>() || isSubclass(RD, "OSMetaClassBase"));
 }
 
-bool RacyUAFChecker::isSingleton(Decl *D) const {
+bool RacyUAFChecker::isSingletonType(Decl *D) const {
   return D && !ast_matchers::match(SingletonMatcher, *D, D->getASTContext()).empty();
+}
+
+bool RacyUAFChecker::isSingletonRegion(const MemRegion *R) const {
+  if (const auto DR = dyn_cast_or_null<DeclRegion>(R)) {
+    if (const auto D = cast<NamedDecl>(DR->getDecl())) {
+      return isa<GlobalsSpaceRegion>(R->getMemorySpace()) && (
+               D->getName() == "kernel_task" ||
+               D->getName() == "gIORemoveOnReadProperties"
+             );
+    }
+  }
+  return false;
 }
 
 template<class T>
