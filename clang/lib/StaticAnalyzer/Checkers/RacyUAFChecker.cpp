@@ -38,6 +38,14 @@ namespace {
     }
   };
 
+  struct SharedResourceAttr {
+    static bool classof(const Attr *A) {
+      if (auto AA = dyn_cast<AnnotateAttr>(A))
+        return AA->getAnnotation() == "shared_resource";
+      return false;
+    }
+  };
+
   // fake CallExpr to use with CallDescriptions when a real CallExpr is not available:
   class DummyFunctionCall : public AnyFunctionCall {
   public:
@@ -922,6 +930,7 @@ ProgramStateRef RacyUAFChecker::createRefBinding(ProgramStateRef State, SymbolRe
 
   bool derivedFromEntryArg = State->contains<EntryArguments>(forSym);
   bool derivedFromSingleton = false;
+  bool derivedFromSharedResource = false;
   SymbolRef rootSym = forSym;
 
   if (auto *RD = getSymbolPointeeTypeDecl(forSym)) {
@@ -938,6 +947,14 @@ ProgramStateRef RacyUAFChecker::createRefBinding(ProgramStateRef State, SymbolRe
       derivedFromSingleton = true;
       break;
     }
+    // check if this region is explicitly marked as shared:
+    if (auto *DR = dyn_cast<DeclRegion>(parent)) {
+      if (DR->getDecl()->hasAttr<SharedResourceAttr>()) {
+        derivedFromSharedResource = true;
+        break;
+      }
+    }
+
     // check if this region is a SymRegion for an entry symbol:
     if (const auto *SymR = dyn_cast<SymbolicRegion>(parent)) {
       SymbolRef sym = SymR->getSymbol();
@@ -949,14 +966,14 @@ ProgramStateRef RacyUAFChecker::createRefBinding(ProgramStateRef State, SymbolRe
     }
   }
   bool derivedFromGlobal = false;
-  if (!derivedFromEntryArg && !derivedFromSingleton) {
+  if (!derivedFromEntryArg && !derivedFromSingleton && !derivedFromSharedResource) {
     // not derived from an entrypoint argument, check if the root symbol is in the global scope:
     const MemSpaceRegion *memSpace = getSymbolMemorySpace(rootSym);
     if (dyn_cast_or_null<GlobalsSpaceRegion>(memSpace)) {
       derivedFromGlobal = true;
     }
   }
-  bool raceable = (derivedFromEntryArg || derivedFromGlobal) && !derivedFromSingleton;
+  bool raceable = (derivedFromEntryArg || derivedFromGlobal || derivedFromSharedResource) && !derivedFromSingleton;
   State = State->set<RefBindings>(forSym, raceable ? RefVal::makeUnretained() : RefVal::makeUnknownOrigin());
   return State;
 }
