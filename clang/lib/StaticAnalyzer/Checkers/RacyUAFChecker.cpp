@@ -1029,16 +1029,6 @@ bool RacyUAFChecker::isSingletonRegion(const MemRegion *R) const {
   return false;
 }
 
-template<class T>
-inline bool doSetsIntersect(T &setA, T &setB) {
-  for (const auto &v: setA) {
-    if (setB.contains(v)) {
-      return true;
-    }
-  }
-  return false;
-}
-
 SmallLockSet RacyUAFChecker::findLocksProtectingSymbol(ProgramStateRef State,
                                                        SymbolRef sym) const {
   SmallLockSet locks;
@@ -1050,12 +1040,11 @@ SmallLockSet RacyUAFChecker::findLocksProtectingSymbol(ProgramStateRef State,
 
   llvm::ImmutableSet<const MemRegion *> allLocks = State->get<LockSet>();
   for (const MemRegion *lockR: allLocks) {
-    llvm::SmallSet<const MemRegion *, 8> lockParents;
     for (const MemRegion *parent = lockR; parent; parent = getParentRegion(parent)) {
-      lockParents.insert(parent);
-    }
-    if (doSetsIntersect(symParents, lockParents)) {
-      locks.insert(lockR);
+      if (symParents.contains(parent)) {
+        locks.insert(lockR);
+        break;
+      }
     }
   }
 
