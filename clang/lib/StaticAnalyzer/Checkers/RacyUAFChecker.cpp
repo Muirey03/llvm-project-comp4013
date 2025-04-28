@@ -1183,25 +1183,15 @@ PathDiagnosticPieceRef UAFBugVisitor::VisitNode(const ExplodedNode *N, BugReport
   ProgramStateRef State = N->getState();
   ProgramStateRef StatePrev = N->getFirstPred()->getState();
 
-  if (Var) {
-    const LocalRef *newLocalRef = State->get<LocalRefs>(Var);
-    const LocalRef *oldLocalRef = StatePrev->get<LocalRefs>(Var);
-    if (newLocalRef) {
-      bool newSafe = newLocalRef->isSafe();
-      if (!oldLocalRef) {
-        OS << (newSafe ? "Safe" : "Unsafe") << " reference ";
-        explainObject(OS, Var);
-        OS << " taken";
-        reported = true;
-      } else {
-        bool oldSafe = oldLocalRef->isSafe();
-        if (oldSafe && !newSafe) {
-          explainObject(OS, Var);
-          OS << " marked as unsafe";
-          reported = true;
-        }
-      }
-    }
+  const LocalRef *newLocalRef = Var ? State->get<LocalRefs>(Var) : nullptr;
+  const LocalRef *oldLocalRef = Var ? StatePrev->get<LocalRefs>(Var) : nullptr;
+  bool markedAsUnsafe = (newLocalRef && oldLocalRef && !newLocalRef->isSafe() && oldLocalRef->isSafe());
+
+  if (newLocalRef && !oldLocalRef) {
+    OS << (newLocalRef->isSafe() ? "Safe" : "Unsafe") << " reference ";
+    explainObject(OS, Var);
+    OS << " taken";
+    reported = true;
   }
 
   if (!reported) {
@@ -1219,6 +1209,11 @@ PathDiagnosticPieceRef UAFBugVisitor::VisitNode(const ExplodedNode *N, BugReport
           reported = true;
         } else if (oldCnt > newCnt) {
           OS << "Object released";
+          if (markedAsUnsafe) {
+            OS << ", ";
+            explainObject(OS, Var);
+            OS << " marked as unsafe";
+          }
           reported = true;
         }
       }
@@ -1235,8 +1230,19 @@ PathDiagnosticPieceRef UAFBugVisitor::VisitNode(const ExplodedNode *N, BugReport
       reported = true;
     } else if (oldLockCnt > newLockCnt) {
       OS << "Lock dropped";
+      if (markedAsUnsafe) {
+        OS << ", ";
+        explainObject(OS, Var);
+        OS << " marked as unsafe";
+      }
       reported = true;
     }
+  }
+
+  if (!reported && markedAsUnsafe) {
+    explainObject(OS, Var);
+    OS << " marked as unsafe";
+    reported = true;
   }
 
   if (!reported) {
